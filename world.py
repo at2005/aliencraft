@@ -1,0 +1,114 @@
+import torch
+import torch.nn.functional as F
+from differential import Differential
+
+
+class Types:
+    def __init__(self, batch_size: int, num_properties: int, height: int, width: int):
+        self.properties = torch.zeros(batch_size, height, width, num_properties)
+
+    def set_properties(self, properties: torch.Tensor):
+        self.properties = properties
+
+
+class TechTree:
+    def __init__(self):
+        self.root = None
+        # relations describe how types compose with one other
+        self.num_materials = 0
+        self.num_total_products = 100
+
+        # each entry is composed of two other entries
+        self.tech_tree = torch.zeros(self.num_total_products, self.num_total_products)
+
+
+class Universe:
+    def __init__(
+        self,
+        batch_size: int,
+        width: int,
+        height: int,
+        num_types: int,
+        num_properties: int,
+        num_fields: int,
+    ):
+        # each cell has a type
+        self.width = width
+        self.height = height
+        self.num_types = num_types
+        self.num_properties = num_properties
+        self.num_fields = num_fields
+        self.batch_size = batch_size
+
+        self.grid = torch.zeros(batch_size, width, height)
+        self.velocity_field = torch.zeros(batch_size, width, height, 2)
+        # and each type has a properties tensor
+        self.types = Types(batch_size, num_properties, width, height)
+        # forces are mediated by scalar vfields
+        self.fields = torch.zeros(batch_size, num_fields, width, height)
+
+        self.differential = Differential(num_fields)
+
+        self.dt = 0.01
+        self.field_vel = 1.0
+
+        self.source_types = [1, 2, 3]
+
+        ii, jj = torch.meshgrid(
+            torch.arange(self.width), torch.arange(self.height), indexing="ij"
+        )
+        self.positions = torch.stack([ii, jj], dim=-1).unsqueeze(0)  #
+
+    def seed_universe(self):
+        self.grid = torch.randint(
+            0, self.num_types, (self.batch_size, self.width, self.height)
+        )
+
+    def move(self, grid: torch.Tensor, velocity: torch.Tensor):
+        new_positions = self.positions + velocity * self.dt
+        new_positions = (
+            new_positions.round()
+            .clamp(0, self.width - 1)
+            .clamp(0, self.height - 1)
+            .long()
+        )
+        new_grid = torch.zeros_like(grid)
+        new_grid[:, new_positions[..., 0], new_positions[..., 1]] = grid[
+            :, self.positions[..., 0], self.positions[..., 1]
+        ]
+        return new_grid
+
+    def perlin(self):
+        pass
+
+    def step_grid(self):
+        # compute forces for each cell
+        field_force = -self.differential.grad(self.fields)  # b, 2, num_fields, h, w
+        field_force = field_force.permute(0, 3, 4, 1, 2)  # b, h, w, 2, num_fields
+        field_force = field_force.sum(dim=-1)  # b, h, w, 2
+        self.velocity_field = self.velocity_field + field_force * self.dt
+        return self.move(self.grid, self.velocity_field)
+
+    def step_fields(self):
+        # wave propagation for now
+        delta_fields = self.field_vel * self.differential.laplacian(self.fields)
+        # sources are applied using curl or div operators
+        # we need to gather the types of cells that can act as sources
+        mask = torch.isin(
+            self.grid, torch.tensor(self.source_types, device=self.grid.device)
+        )
+        # source_term = (self.differential.curl(self.fields) + self.differential.div(self.fields)) * mask
+        source_term = self.differential.laplacian(self.fields) * mask
+        return self.fields + delta_fields * self.dt + source_term
+
+    def step(self, action=None):
+        self.fields = self.step_fields()
+        self.grid = self.step_grid()
+
+
+if __name__ == "__main__":
+    universe = Universe(
+        batch_size=1, width=4, height=4, num_types=2, num_properties=10, num_fields=3
+    )  # create a universe
+    universe.seed_universe()
+    universe.step()
