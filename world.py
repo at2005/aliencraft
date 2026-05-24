@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from differential import Differential
+import math
 
 
 class Types:
@@ -45,24 +46,107 @@ class Universe:
         # and each type has a properties tensor
         self.types = Types(batch_size, num_properties, width, height)
         # forces are mediated by scalar vfields
-        self.fields = torch.zeros(batch_size, num_fields, width, height)
+        self.fields = torch.randn(batch_size, num_fields, width, height)
 
         self.differential = Differential(num_fields)
 
         self.dt = 0.01
-        self.field_vel = 1.0
+        self.field_vel = 10.0
 
         self.source_types = [1, 2, 3]
+        self.damping = 0.4
 
         ii, jj = torch.meshgrid(
             torch.arange(self.width), torch.arange(self.height), indexing="ij"
         )
+
         self.positions = torch.stack([ii, jj], dim=-1).unsqueeze(0)  #
 
+        self.grads = self.build_grads()
+
+    def build_grads(self):
+        return torch.tensor(
+            [
+                [1, 0],
+                [0, 1],
+                [-1, 0],
+                [0, -1],
+                [1 / math.sqrt(2), 1 / math.sqrt(2)],
+                [1 / math.sqrt(2), -1 / math.sqrt(2)],
+                [-1 / math.sqrt(2), 1 / math.sqrt(2)],
+                [-1 / math.sqrt(2), -1 / math.sqrt(2)],
+            ]
+        )  # 8, 2
+
+    def quintic_smoothing(self, t):
+        return t * t * t * (t * (t * 6 - 15) + 10)
+
+    def lerp(self, a, b, t):
+        return a + t * (b - a)
+
+    def perlin(
+        self,
+        scale: float,
+        seed: torch.Tensor,  # b,
+    ):
+
+        positions = self.positions * scale  # b, h, w, 2
+
+        cell = positions.floor()  # b, h, w, 2
+        local = positions - cell
+
+        def hash(
+            x: torch.Tensor,  # b, h, w
+            y: torch.Tensor,  # b, h, w
+        ):
+            h = (
+                (seed.unsqueeze(-1).unsqueeze(-1) * 2654435761)
+                ^ (x.long() * 73856093)
+                ^ (y.long() * 19349663)
+            )
+            h = h ^ (h >> 16)
+            h = h * 0x85EBCA6B
+            h = h ^ (h >> 13)
+            h = h * 0xC2B2AE35
+            h = h ^ (h >> 16)
+            return (h % self.grads.shape[0]).long()
+
+        x = cell[..., 0]
+        y = cell[..., 1]
+        grad1: torch.Tensor = self.grads[hash(x, y)]
+        grad2: torch.Tensor = self.grads[hash(x + 1, y)]
+        grad3: torch.Tensor = self.grads[hash(x, y + 1)]
+        grad4: torch.Tensor = self.grads[hash(x + 1, y + 1)]
+
+        dot1 = grad1[..., 0] * local[..., 0] + grad1[..., 1] * local[..., 1]
+        dot2 = grad2[..., 0] * (local[..., 0] - 1) + grad2[..., 1] * local[..., 1]
+        dot3 = grad3[..., 0] * local[..., 0] + grad3[..., 1] * (local[..., 1] - 1)
+        dot4 = grad4[..., 0] * (local[..., 0] - 1) + grad4[..., 1] * (local[..., 1] - 1)
+
+        smoothed_positions = self.quintic_smoothing(local)
+        u = smoothed_positions[..., 0]
+        v = smoothed_positions[..., 1]
+
+        a = self.lerp(dot1, dot2, u)
+        b = self.lerp(dot3, dot4, u)
+        c = self.lerp(a, b, v)
+
+        return c
+
     def seed_universe(self):
-        self.grid = torch.randint(
-            0, self.num_types, (self.batch_size, self.width, self.height)
+        grid1 = torch.full(
+            (self.batch_size, self.width, self.height), 0, dtype=torch.long
         )
+
+        grid2 = torch.full(
+            (self.batch_size, self.width, self.width), 1, dtype=torch.long
+        )
+
+        seed = torch.randint(0, 1000000, (self.batch_size,))
+        perlin = self.perlin(scale=0.05, seed=seed)
+        perlin = perlin / perlin.max(dim=-1, keepdim=True)[0]
+        mask = (perlin > perlin.mean(dim=-1, keepdim=True)).long()
+        self.grid = grid1 * mask + grid2 * (1 - mask)
 
     def move(self, grid: torch.Tensor, velocity: torch.Tensor):
         new_positions = self.positions + velocity * self.dt
@@ -78,9 +162,6 @@ class Universe:
         ]
         return new_grid
 
-    def perlin(self):
-        pass
-
     def step_grid(self):
         # compute forces for each cell
         field_force = -self.differential.grad(self.fields)  # b, 2, num_fields, h, w
@@ -92,14 +173,15 @@ class Universe:
     def step_fields(self):
         # wave propagation for now
         delta_fields = self.field_vel * self.differential.laplacian(self.fields)
+
         # sources are applied using curl or div operators
         # we need to gather the types of cells that can act as sources
-        mask = torch.isin(
-            self.grid, torch.tensor(self.source_types, device=self.grid.device)
-        )
-        # source_term = (self.differential.curl(self.fields) + self.differential.div(self.fields)) * mask
-        source_term = self.differential.laplacian(self.fields) * mask
-        return self.fields + delta_fields * self.dt + source_term
+        # mask = torch.isin(
+        #     self.grid, torch.tensor(self.source_types, device=self.grid.device)
+        # )
+        # # source_term = (self.differential.curl(self.fields) + self.differential.div(self.fields)) * mask
+        # source_term = self.differential.laplacian(self.fields) * mask
+        return self.fields + delta_fields * self.dt - self.damping * self.fields
 
     def step(self, action=None):
         self.fields = self.step_fields()
@@ -110,5 +192,6 @@ if __name__ == "__main__":
     universe = Universe(
         batch_size=1, width=4, height=4, num_types=2, num_properties=10, num_fields=3
     )  # create a universe
+
     universe.seed_universe()
-    universe.step()
+    # universe.step()
