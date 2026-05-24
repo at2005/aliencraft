@@ -5,12 +5,12 @@ from world import Universe
 COLORS = [
     (70, 230, 120),  # bright green
     (70, 130, 230),  # bright blue
-    (10, 10, 20),
     (90, 220, 120),
     (240, 210, 80),
     (180, 90, 240),
     (240, 140, 70),
     (180, 220, 220),
+    (120, 120, 240),
 ]
 
 
@@ -61,7 +61,7 @@ if __name__ == "__main__":
         batch_size=1,
         width=100,
         height=100,
-        num_types=10,
+        num_types=5,
         num_properties=10,
         num_fields=3,
     )  # create a universe

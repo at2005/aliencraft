@@ -134,19 +134,18 @@ class Universe:
         return c
 
     def seed_universe(self):
-        grid1 = torch.full(
-            (self.batch_size, self.width, self.height), 0, dtype=torch.long
-        )
+        fields = []
+        for i in range(self.num_types):
+            seed = torch.randint(0, 1000000, (self.batch_size,))
+            perlin = self.perlin(scale=0.05 / (0.5 * math.sqrt(i + 1)), seed=seed)
+            p_min = perlin.amin(dim=(-2, -1), keepdim=True)
+            p_max = perlin.amax(dim=(-2, -1), keepdim=True)
+            perlin = (perlin - p_min) / (p_max - p_min + 1e-8)
+            fields.append(perlin)
 
-        grid2 = torch.full(
-            (self.batch_size, self.width, self.width), 1, dtype=torch.long
-        )
-
-        seed = torch.randint(0, 1000000, (self.batch_size,))
-        perlin = self.perlin(scale=0.05, seed=seed)
-        perlin = perlin / perlin.max(dim=-1, keepdim=True)[0]
-        mask = (perlin > perlin.mean(dim=-1, keepdim=True)).long()
-        self.grid = grid1 * mask + grid2 * (1 - mask)
+        fields = torch.stack(fields, dim=-1)  # b, h, w, num_types
+        grid = fields.argmax(dim=-1)  # b, h, w
+        self.grid = grid
 
     def move(self, grid: torch.Tensor, velocity: torch.Tensor):
         new_positions = self.positions + velocity * self.dt
@@ -190,8 +189,7 @@ class Universe:
 
 if __name__ == "__main__":
     universe = Universe(
-        batch_size=1, width=4, height=4, num_types=2, num_properties=10, num_fields=3
+        batch_size=1, width=4, height=4, num_types=6, num_properties=10, num_fields=3
     )  # create a universe
-
     universe.seed_universe()
-    # universe.step()
+    print(universe.grid)
