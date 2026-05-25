@@ -40,7 +40,7 @@ class Universe:
         self.field_velocity = torch.zeros(batch_size, num_fields, width, height)
 
         self.field_matter_affinity = torch.nn.Embedding(num_types, num_fields)
-        self.field_matter_affinity.weight.data.random_(0, 1)
+        self.field_matter_affinity.weight.data.uniform_(-1, 1)
 
         self.num_common_types = 4
 
@@ -49,7 +49,7 @@ class Universe:
         self.dt = 0.1
         self.field_vel = 1.0
 
-        self.damping = 0.7
+        self.damping = 0.90
         self.field_damping = 0.99
 
         ii, jj = torch.meshgrid(
@@ -82,6 +82,8 @@ class Universe:
         self.fields_affected_by_types = torch.randint(
             0, self.num_fields, (self.batch_size, self.num_types)
         )  # b, num_types
+
+        self.mass_scale = 5.0
 
     def build_grads(self):
         return torch.tensor(
@@ -231,7 +233,7 @@ class Universe:
             grid, self.distance_kernel, padding=3, groups=self.num_types
         )  # b, num_types, h, w
 
-        mass_equivalent = 10.0 * (
+        mass_equivalent = self.mass_scale * (
             self.properties[..., 0].unsqueeze(-1).unsqueeze(-1)
         )  # b, num_types, 1, 1
 
