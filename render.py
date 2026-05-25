@@ -66,4 +66,4 @@ if __name__ == "__main__":
         num_fields=3,
     )  # create a universe
     universe.seed_universe()
-    render_animation(universe, steps=10)
+    render_animation(universe, steps=100)
