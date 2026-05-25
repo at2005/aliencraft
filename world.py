@@ -46,11 +46,11 @@ class Universe:
 
         self.differential = Differential(num_fields)
 
-        self.dt = 1.0
-        self.field_vel = 2.0
+        self.dt = 0.1
+        self.field_vel = 1.0
 
-        self.source_types = [1, 2, 3]
         self.damping = 0.7
+        self.field_damping = 0.99
 
         ii, jj = torch.meshgrid(
             torch.arange(self.width), torch.arange(self.height), indexing="ij"
@@ -74,7 +74,7 @@ class Universe:
             7,
             7,
         ), "distance_kernel is not the correct shape"
-        self.properties = torch.randn(
+        self.properties = torch.rand(
             self.batch_size, self.num_types, self.num_properties
         )
 
@@ -230,19 +230,28 @@ class Universe:
         grid = F.conv2d(
             grid, self.distance_kernel, padding=3, groups=self.num_types
         )  # b, num_types, h, w
-        mass_equivalent = (
+
+        mass_equivalent = 10.0 * (
             self.properties[..., 0].unsqueeze(-1).unsqueeze(-1)
         )  # b, num_types, 1, 1
+
         # this tells us the field values if we assume inverse 1/r distance from the type weighted by the mass equivalent of the type
         mass_adjusted_field = grid * mass_equivalent  # b, num_types, h, w
         delta_fields_matter = torch.zeros_like(self.fields)  # b, num_fields, h, w
-        delta_fields_matter[:, self.fields_affected_by_types] = mass_adjusted_field
-        print(delta_fields_matter)
+
+        field_idx = self.fields_affected_by_types.unsqueeze(-1).unsqueeze(-1)
+        field_idx = field_idx.expand(
+            -1, -1, self.fields.shape[-2], self.fields.shape[-1]
+        )
+        delta_fields_matter = delta_fields_matter.scatter_add(
+            dim=1, index=field_idx, src=mass_adjusted_field
+        )  # b, num_fields, h, w
+
         total_delta_fields = delta_fields + delta_fields_matter
         self.field_velocity = (
             self.damping * self.field_velocity + total_delta_fields * self.dt
         )
-        return self.fields + self.field_velocity * self.dt
+        return self.field_damping * self.fields + self.field_velocity * self.dt
 
     def step(self, action=None):
         self.fields = self.step_fields()
