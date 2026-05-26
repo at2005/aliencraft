@@ -41,7 +41,14 @@ class Universe:
         self.field_velocity = torch.zeros(batch_size, num_fields, width, height)
 
         self.field_matter_affinity = torch.nn.Embedding(num_types, num_fields)
-        self.field_matter_affinity.weight.data.uniform_(-1, 1)
+        num_active_types = num_types // 2
+        assert num_active_types > 0, "num_active_types must be greater than 0"
+        active_type_ids = torch.randperm(num_types)[:num_active_types]
+        with torch.no_grad():
+            self.field_matter_affinity.weight.zero_()
+            self.field_matter_affinity.weight[active_type_ids] = torch.empty_like(
+                self.field_matter_affinity.weight[active_type_ids]
+            ).uniform_(-1.0, 1.0)
 
         self.num_common_types = 4
 
@@ -160,7 +167,7 @@ class Universe:
         fields = []
         for i in range(self.num_common_types):
             seed = torch.randint(0, 1000000, (self.batch_size,))
-            perlin = self.perlin(scale=0.005 / (0.5 * math.sqrt(i + 1)), seed=seed)
+            perlin = self.perlin(scale=0.05 / (0.5 * math.sqrt(i + 1)), seed=seed)
             p_min = perlin.amin(dim=(-2, -1), keepdim=True)
             p_max = perlin.amax(dim=(-2, -1), keepdim=True)
             perlin = (perlin - p_min) / (p_max - p_min + 1e-8)
@@ -187,7 +194,8 @@ class Universe:
         blocks = blocks.reshape(
             blocks.shape[0], blocks.shape[1], blocks.shape[2], -1
         )  # b, h//2, w//2, 4
-        mod_blocks = blocks.sum(dim=-1) % 24  # b, h//2, w//2
+        weights = torch.tensor([1, 4, 8, 16])
+        mod_blocks = (blocks * weights).sum(dim=-1) % 24  # b, h//2, w//2
         perm_matrix = self.permutation_matrices[mod_blocks]
         blocks = perm_matrix.float() @ blocks.unsqueeze(-1).float()
         blocks = blocks.squeeze(-1)
@@ -198,30 +206,49 @@ class Universe:
 
     def move(self, grid: torch.Tensor, velocity: torch.Tensor, step: int):
         new_positions = self.positions + velocity * self.dt
-        new_positions = (
-            new_positions.round()
-            .clamp(0, self.width - 1)
-            .clamp(0, self.height - 1)
-            .long()
-        )
+        new_positions = (new_positions.floor().long()) % self.width  # b, h, w, 2
+        new_grid = torch.zeros_like(grid)
+        b = torch.arange(grid.shape[0], device=grid.device)[:, None, None]
+
+        # how do we handle collisions? a cell cannot move into a cell that is already occupied
+        # the way we check this is for each cell we check if the new position is currently occupied
+        # if it is, we don't move it there, the cell stays in its current position
+        is_occupied = (
+            grid[b, new_positions[..., 0], new_positions[..., 1]] > 0
+        )  # b, h, w
+        is_occupied = is_occupied.unsqueeze(-1)  # b, h, w, 1
+
+        # move the cells that are not occupied to their new positions
+        new_positions = new_positions.where(~is_occupied, self.positions)
+        is_able_to_move = (
+            grid[b, self.positions[..., 0], self.positions[..., 1]] > 0
+        )  # b, h, w
+        is_able_to_move = is_able_to_move.unsqueeze(-1)  # b, h, w, 1
+        new_positions = new_positions.where(is_able_to_move, self.positions)
+
+        new_grid[b, new_positions[..., 0], new_positions[..., 1]] = grid[
+            b, self.positions[..., 0], self.positions[..., 1]
+        ]
+        return new_grid
+
         # how do we choose to move matter?
         # we need to figure out how to handle rigidity
         # so like, cells can push against each other, exert force on each other etc.
         # simplest soln: use ca-like rules to update local grids
 
-        if step % 2 == 0:
-            grid = torch.roll(grid, shifts=(1, 1), dims=(-2, -1))
+        # if step % 2 == 0:
+        #     grid = torch.roll(grid, shifts=(1, 1), dims=(-2, -1))
 
-        blocks = grid.reshape(
-            -1, grid.shape[-2] // 2, 2, grid.shape[-1] // 2, 2
-        )  # b, h//2, 2, w//2, 2
-        blocks = blocks.permute(0, 1, 3, 2, 4)  # b, h//2, w//2, 2, 2
-        new_blocks: torch.Tensor = self.block_rule(blocks)  # b, h//2, w//2, 2, 2
-        new_blocks = new_blocks.permute(0, 1, 3, 2, 4)  # b, h//2, 2, w//2, 2
-        new_grid = new_blocks.reshape_as(grid)
-        if step % 2 == 0:
-            new_grid = torch.roll(new_grid, shifts=(-1, -1), dims=(-2, -1))
-        return new_grid
+        # blocks = grid.reshape(
+        #     -1, grid.shape[-2] // 2, 2, grid.shape[-1] // 2, 2
+        # )  # b, h//2, 2, w//2, 2
+        # blocks = blocks.permute(0, 1, 3, 2, 4)  # b, h//2, w//2, 2, 2
+        # new_blocks: torch.Tensor = self.block_rule(blocks)  # b, h//2, w//2, 2, 2
+        # new_blocks = new_blocks.permute(0, 1, 3, 2, 4)  # b, h//2, 2, w//2, 2
+        # new_grid = new_blocks.reshape_as(grid)
+        # if step % 2 == 0:
+        #     new_grid = torch.roll(new_grid, shifts=(-1, -1), dims=(-2, -1))
+        # return new_grid
 
     def step_grid(self, step: int):
         # compute forces for each cell
@@ -233,6 +260,7 @@ class Universe:
         field_force = -self.differential.grad(self.fields)  # b, 2, num_fields, h, w
         field_force = field_force.permute(0, 3, 4, 1, 2)  # b, h, w, 2, num_fields
         field_force_weighted = (field_force * affinity).sum(dim=-1)  # b, h, w, 2
+
         self.grid_velocity = (
             self.damping * self.grid_velocity + field_force_weighted * self.dt
         )
@@ -293,6 +321,7 @@ class Universe:
 
 
 if __name__ == "__main__":
+    torch.inference_mode()
     universe = Universe(
         batch_size=1, width=10, height=10, num_types=6, num_properties=10, num_fields=3
     )  # create a universe

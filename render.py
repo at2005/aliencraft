@@ -1,3 +1,4 @@
+import torch
 import pygame
 from world import Universe
 
@@ -69,13 +70,14 @@ def _make_screen(grid, cell_size):
 
 
 if __name__ == "__main__":
+    torch.inference_mode()
     universe = Universe(
         batch_size=1,
         width=100,
         height=100,
         num_types=5,
         num_properties=10,
-        num_fields=3,
+        num_fields=2,
     )  # create a universe
     universe.seed_universe()
     render_animation(universe, steps=100)
