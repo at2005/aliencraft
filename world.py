@@ -93,6 +93,24 @@ class Universe:
         self.batch_idx = torch.arange(self.batch_size, device=self.grid.device)
 
         self.agent_position = torch.randint(0, self.width, (self.batch_size, 2))  # b, 2
+        ii_sprite, jj_sprite = torch.meshgrid(
+            torch.arange(self.width), torch.arange(self.height), indexing="ij"
+        )
+        self.sprite_positions = torch.stack([ii_sprite, jj_sprite], dim=-1).unsqueeze(
+            0
+        )  # b, width, height, 2
+        self.init_sprites(sprite_resolution=4)
+
+    def init_sprites(self, sprite_resolution: int):
+        perlin = self.perlin(
+            scale=0.1,
+            positions=self.sprite_positions,
+            seed=torch.randint(0, 1000000, (self.batch_size * self.num_types,)),
+        )
+        perlin = perlin.reshape(
+            self.batch_size, self.num_types, sprite_resolution, sprite_resolution
+        )  # b, num_types, sprite_resolution, sprite_resolution
+        self.sprites = perlin
 
     def craft(
         self,
@@ -130,10 +148,11 @@ class Universe:
     def perlin(
         self,
         scale: float,
+        positions: torch.Tensor,
         seed: torch.Tensor,  # b,
     ):
 
-        positions = self.positions * scale  # b, h, w, 2
+        positions = positions * scale  # b, h, w, 2
 
         cell = positions.floor()  # b, h, w, 2
         local = positions - cell
@@ -180,7 +199,11 @@ class Universe:
         fields = []
         for i in range(self.num_common_types):
             seed = torch.randint(0, 1000000, (self.batch_size,))
-            perlin = self.perlin(scale=0.05 / (0.5 * math.sqrt(i + 1)), seed=seed)
+            perlin = self.perlin(
+                scale=0.05 / (0.5 * math.sqrt(i + 1)),
+                positions=self.positions,
+                seed=seed,
+            )
             p_min = perlin.amin(dim=(-2, -1), keepdim=True)
             p_max = perlin.amax(dim=(-2, -1), keepdim=True)
             perlin = (perlin - p_min) / (p_max - p_min + 1e-8)
