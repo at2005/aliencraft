@@ -4,7 +4,7 @@ from world import Universe
 
 
 COLORS = [
-    (38, 47, 54),  # basalt
+    (0, 0, 0),  # empty
     (78, 121, 167),  # muted blue
     (89, 161, 79),  # moss
     (242, 142, 43),  # ochre

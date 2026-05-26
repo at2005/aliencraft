@@ -5,17 +5,6 @@ import math
 import itertools
 
 
-class TechTree:
-    def __init__(self):
-        self.root = None
-        # relations describe how types compose with one other
-        self.num_materials = 0
-        self.num_total_products = 100
-
-        # each entry is composed of two other entries
-        self.tech_tree = torch.zeros(self.num_total_products, self.num_total_products)
-
-
 class Universe:
     def __init__(
         self,
@@ -92,7 +81,20 @@ class Universe:
         )  # b, num_types
 
         self.mass_scale = 5.0
-        self.margolus_conv = torch.nn.Conv2d(16, 1, kernel_size=2, stride=2)
+        self.batch_idx = torch.arange(self.batch_size, device=self.grid.device)
+
+    def craft(
+        self,
+        mat1_pos: torch.Tensor,  # b, 2
+        mat2_pos: torch.Tensor,  # b, 2
+    ):
+        mat1_type = self.grid[self.batch_idx, mat1_pos[..., 0], mat1_pos[..., 1]]  # b,
+        mat2_type = self.grid[self.batch_idx, mat2_pos[..., 0], mat2_pos[..., 1]]  # b,
+        # you craft with two types to get a new type
+        m = torch.max(mat1_type, mat2_type)
+        n = torch.min(mat1_type, mat2_type)
+        new_type = m * (m + 1) // 2 + n + 1
+        return new_type + self.num_common_types
 
     def build_grads(self):
         return torch.tensor(
@@ -204,51 +206,38 @@ class Universe:
         ).long()
         return blocks
 
+    def occupany_function(self, grid: torch.Tensor, positions: torch.Tensor):
+        is_occupied = (
+            grid[self.batch_idx, positions[..., 0], positions[..., 1]] > 0
+        )  # b, h, w
+        is_occupied = is_occupied.unsqueeze(-1)  # b, h, w, 1
+        return is_occupied
+
     def move(self, grid: torch.Tensor, velocity: torch.Tensor, step: int):
         new_positions = self.positions + velocity * self.dt
         new_positions = (new_positions.floor().long()) % self.width  # b, h, w, 2
         new_grid = torch.zeros_like(grid)
-        b = torch.arange(grid.shape[0], device=grid.device)[:, None, None]
 
-        # how do we handle collisions? a cell cannot move into a cell that is already occupied
-        # the way we check this is for each cell we check if the new position is currently occupied
-        # if it is, we don't move it there, the cell stays in its current position
-        is_occupied = (
-            grid[b, new_positions[..., 0], new_positions[..., 1]] > 0
-        )  # b, h, w
-        is_occupied = is_occupied.unsqueeze(-1)  # b, h, w, 1
+        is_occupied = self.occupany_function(grid, new_positions)
 
         # move the cells that are not occupied to their new positions
         new_positions = new_positions.where(~is_occupied, self.positions)
         is_able_to_move = (
-            grid[b, self.positions[..., 0], self.positions[..., 1]] > 0
+            grid[self.batch_idx, self.positions[..., 0], self.positions[..., 1]] > 0
         )  # b, h, w
         is_able_to_move = is_able_to_move.unsqueeze(-1)  # b, h, w, 1
         new_positions = new_positions.where(is_able_to_move, self.positions)
 
-        new_grid[b, new_positions[..., 0], new_positions[..., 1]] = grid[
-            b, self.positions[..., 0], self.positions[..., 1]
-        ]
+        alive = grid > 0
+
+        new_positions = new_positions.where(alive.unsqueeze(-1), self.positions)
+        # we only want to write cells into positions such that the positions in the original
+        # grid were alive
+        b = self.batch_idx.expand_as(grid)
+        new_grid[
+            b[alive], new_positions[..., 0][alive], new_positions[..., 1][alive]
+        ] = grid[alive]
         return new_grid
-
-        # how do we choose to move matter?
-        # we need to figure out how to handle rigidity
-        # so like, cells can push against each other, exert force on each other etc.
-        # simplest soln: use ca-like rules to update local grids
-
-        # if step % 2 == 0:
-        #     grid = torch.roll(grid, shifts=(1, 1), dims=(-2, -1))
-
-        # blocks = grid.reshape(
-        #     -1, grid.shape[-2] // 2, 2, grid.shape[-1] // 2, 2
-        # )  # b, h//2, 2, w//2, 2
-        # blocks = blocks.permute(0, 1, 3, 2, 4)  # b, h//2, w//2, 2, 2
-        # new_blocks: torch.Tensor = self.block_rule(blocks)  # b, h//2, w//2, 2, 2
-        # new_blocks = new_blocks.permute(0, 1, 3, 2, 4)  # b, h//2, 2, w//2, 2
-        # new_grid = new_blocks.reshape_as(grid)
-        # if step % 2 == 0:
-        #     new_grid = torch.roll(new_grid, shifts=(-1, -1), dims=(-2, -1))
-        # return new_grid
 
     def step_grid(self, step: int):
         # compute forces for each cell
