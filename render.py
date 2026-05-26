@@ -73,11 +73,13 @@ if __name__ == "__main__":
     torch.inference_mode()
     universe = Universe(
         batch_size=1,
-        width=100,
-        height=100,
-        num_types=5,
+        width=200,
+        height=200,
+        num_types=10,
+        num_common_types=4,
+        num_sparse_types=2,
         num_properties=10,
         num_fields=2,
     )  # create a universe
     universe.seed_universe()
-    render_animation(universe, steps=100)
+    render_animation(universe, steps=1000)

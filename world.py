@@ -12,6 +12,8 @@ class Universe:
         width: int,
         height: int,
         num_types: int,
+        num_common_types: int,
+        num_sparse_types: int,
         num_properties: int,
         num_fields: int,
     ):
@@ -30,7 +32,7 @@ class Universe:
         self.field_velocity = torch.zeros(batch_size, num_fields, width, height)
 
         self.field_matter_affinity = torch.nn.Embedding(num_types, num_fields)
-        num_active_types = num_types // 2
+        num_active_types = num_types - 1
         assert num_active_types > 0, "num_active_types must be greater than 0"
         active_type_ids = torch.randperm(num_types)[:num_active_types]
         with torch.no_grad():
@@ -40,6 +42,11 @@ class Universe:
             ).uniform_(-1.0, 1.0)
 
         self.num_common_types = 4
+        self.num_sparse_types = 2
+
+        assert (
+            self.num_common_types + self.num_sparse_types <= self.num_types
+        ), "num_common_types + num_sparse_types must be less than num_types"
 
         self.differential = Differential(num_fields)
 
@@ -47,7 +54,7 @@ class Universe:
         self.field_vel = 1.0
 
         self.damping = 0.90
-        self.field_damping = 0.99
+        self.field_damping = 0.90
 
         ii, jj = torch.meshgrid(
             torch.arange(self.width), torch.arange(self.height), indexing="ij"
@@ -71,9 +78,11 @@ class Universe:
             7,
             7,
         ), "distance_kernel is not the correct shape"
-        self.properties = torch.rand(
+        self.properties = torch.zeros(
             self.batch_size, self.num_types, self.num_properties
         )
+
+        self.properties.uniform_(-1.0, 1.0)
 
         # each type affects one field
         self.fields_affected_by_types = torch.randint(
@@ -82,6 +91,8 @@ class Universe:
 
         self.mass_scale = 5.0
         self.batch_idx = torch.arange(self.batch_size, device=self.grid.device)
+
+        self.agent_position = torch.randint(0, self.width, (self.batch_size, 2))  # b, 2
 
     def craft(
         self,
@@ -93,8 +104,8 @@ class Universe:
         # you craft with two types to get a new type
         m = torch.max(mat1_type, mat2_type)
         n = torch.min(mat1_type, mat2_type)
-        new_type = m * (m + 1) // 2 + n + 1
-        return new_type + self.num_common_types
+        new_type = m * (m + 1) // 2 + n + 1 + self.num_common_types
+        return new_type if new_type < self.num_types else None
 
     def build_grads(self):
         return torch.tensor(
@@ -181,7 +192,7 @@ class Universe:
         sparse_mask = torch.rand(self.batch_size, self.width, self.height) < 0.01
         rare_types = torch.randint(
             self.num_common_types,
-            self.num_types,
+            self.num_common_types + self.num_sparse_types,
             (self.batch_size, self.width, self.height),
         )  # b, h, w
         grid[sparse_mask] = rare_types[sparse_mask]
@@ -303,9 +314,27 @@ class Universe:
         )
         return self.field_damping * self.fields + self.field_velocity * self.dt
 
+    def apply_action(self, action: torch.Tensor):
+        # action is b, action_dim
+        # we feed the continuous action into an actuator that is altered per-universe
+        # for now tho let's just say teh first 4 dimensions tell us the direction of motion
+        direction = action[..., :4]  # b, 4
+        argmax_direction = direction.argmax(dim=-1)  # b,
+        directions = torch.tensor([[1, 0], [0, 1], [-1, 0], [0, -1]])  # 4, 2
+        direction = directions[argmax_direction]  # b, 2
+        new_position = self.agent_position + direction
+        new_position = new_position % self.width
+        return new_position
+
+    def render(self):
+        # render the universe with the sprites
+        pass
+
     def step(self, step: int, action=None):
         self.fields = self.step_fields()
         self.grid = self.step_grid(step)
+        if action is not None:
+            self.agent_position = self.apply_action(action)
         # print(self.fields)
 
 
