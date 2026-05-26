@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from differential import Differential
 import math
+import itertools
 
 
 class TechTree:
@@ -84,6 +85,7 @@ class Universe:
         )  # b, num_types
 
         self.mass_scale = 5.0
+        self.margolus_conv = torch.nn.Conv2d(16, 1, kernel_size=2, stride=2)
 
     def build_grads(self):
         return torch.tensor(
@@ -158,7 +160,7 @@ class Universe:
         fields = []
         for i in range(self.num_common_types):
             seed = torch.randint(0, 1000000, (self.batch_size,))
-            perlin = self.perlin(scale=0.05 / (0.5 * math.sqrt(i + 1)), seed=seed)
+            perlin = self.perlin(scale=0.005 / (0.5 * math.sqrt(i + 1)), seed=seed)
             p_min = perlin.amin(dim=(-2, -1), keepdim=True)
             p_max = perlin.amax(dim=(-2, -1), keepdim=True)
             perlin = (perlin - p_min) / (p_max - p_min + 1e-8)
@@ -177,7 +179,24 @@ class Universe:
 
         self.grid = grid
 
-    def move(self, grid: torch.Tensor, velocity: torch.Tensor):
+        I = torch.eye(4)
+        perms = torch.tensor(list(itertools.permutations(range(4))))
+        self.permutation_matrices = I[perms]
+
+    def block_rule(self, blocks: torch.Tensor):
+        blocks = blocks.reshape(
+            blocks.shape[0], blocks.shape[1], blocks.shape[2], -1
+        )  # b, h//2, w//2, 4
+        mod_blocks = blocks.sum(dim=-1) % 24  # b, h//2, w//2
+        perm_matrix = self.permutation_matrices[mod_blocks]
+        blocks = perm_matrix.float() @ blocks.unsqueeze(-1).float()
+        blocks = blocks.squeeze(-1)
+        blocks = blocks.view(
+            blocks.shape[0], blocks.shape[1], blocks.shape[2], 2, 2
+        ).long()
+        return blocks
+
+    def move(self, grid: torch.Tensor, velocity: torch.Tensor, step: int):
         new_positions = self.positions + velocity * self.dt
         new_positions = (
             new_positions.round()
@@ -185,14 +204,26 @@ class Universe:
             .clamp(0, self.height - 1)
             .long()
         )
-        new_grid = torch.zeros_like(grid)
         # how do we choose to move matter?
-        new_grid[:, new_positions[..., 0], new_positions[..., 1]] = grid[
-            :, self.positions[..., 0], self.positions[..., 1]
-        ]
+        # we need to figure out how to handle rigidity
+        # so like, cells can push against each other, exert force on each other etc.
+        # simplest soln: use ca-like rules to update local grids
+
+        if step % 2 == 0:
+            grid = torch.roll(grid, shifts=(1, 1), dims=(-2, -1))
+
+        blocks = grid.reshape(
+            -1, grid.shape[-2] // 2, 2, grid.shape[-1] // 2, 2
+        )  # b, h//2, 2, w//2, 2
+        blocks = blocks.permute(0, 1, 3, 2, 4)  # b, h//2, w//2, 2, 2
+        new_blocks: torch.Tensor = self.block_rule(blocks)  # b, h//2, w//2, 2, 2
+        new_blocks = new_blocks.permute(0, 1, 3, 2, 4)  # b, h//2, 2, w//2, 2
+        new_grid = new_blocks.reshape_as(grid)
+        if step % 2 == 0:
+            new_grid = torch.roll(new_grid, shifts=(-1, -1), dims=(-2, -1))
         return new_grid
 
-    def step_grid(self):
+    def step_grid(self, step: int):
         # compute forces for each cell
         # field_matter_affinity is b, num_types, num_fields
         affinity: torch.Tensor = self.field_matter_affinity(
@@ -205,7 +236,7 @@ class Universe:
         self.grid_velocity = (
             self.damping * self.grid_velocity + field_force_weighted * self.dt
         )
-        return self.move(self.grid, self.grid_velocity)
+        return self.move(self.grid, self.grid_velocity, step)
 
     def step_fields(self):
         # wave propagation for now
@@ -255,15 +286,16 @@ class Universe:
         )
         return self.field_damping * self.fields + self.field_velocity * self.dt
 
-    def step(self, action=None):
+    def step(self, step: int, action=None):
         self.fields = self.step_fields()
-        self.grid = self.step_grid()
-        print(self.fields)
+        self.grid = self.step_grid(step)
+        # print(self.fields)
 
 
 if __name__ == "__main__":
     universe = Universe(
-        batch_size=1, width=4, height=4, num_types=6, num_properties=10, num_fields=3
+        batch_size=1, width=10, height=10, num_types=6, num_properties=10, num_fields=3
     )  # create a universe
     universe.seed_universe()
-    universe.step()
+    for step in range(10):
+        universe.step(step)

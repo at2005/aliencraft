@@ -3,15 +3,27 @@ from world import Universe
 
 
 COLORS = [
-    (70, 230, 120),  # bright green
-    (70, 130, 230),  # bright blue
-    (90, 220, 120),
-    (240, 210, 80),
-    (180, 90, 240),
-    (240, 140, 70),
-    (180, 220, 220),
-    (120, 120, 240),
+    (38, 47, 54),  # basalt
+    (78, 121, 167),  # muted blue
+    (89, 161, 79),  # moss
+    (242, 142, 43),  # ochre
+    (225, 87, 89),  # clay
+    (118, 183, 178),  # mineral teal
+    (176, 122, 161),  # mauve
+    (156, 117, 95),  # umber
+    (186, 176, 172),  # stone
+    (237, 201, 72),  # amber
 ]
+
+
+def _color_for_type(cell_type):
+    if cell_type < len(COLORS):
+        return COLORS[cell_type]
+
+    hue = (cell_type * 0.61803398875) % 1.0
+    color = pygame.Color(0)
+    color.hsva = (hue * 360, 48, 68, 100)
+    return color
 
 
 def render(universe, batch_index=0, cell_size=6):
@@ -33,7 +45,7 @@ def render_animation(universe, steps=10, batch_index=0, cell_size=6, fps=4):
                 pygame.quit()
                 return
 
-        universe.step()
+        universe.step(step)
         _draw_grid(screen, universe.grid[batch_index], cell_size)
         pygame.display.set_caption(f"aliencraft step {step}")
         pygame.display.flip()
@@ -46,7 +58,7 @@ def _draw_grid(screen, grid, cell_size):
     grid = grid.detach().cpu().long()
     for x in range(grid.shape[0]):
         for y in range(grid.shape[1]):
-            color = COLORS[int(grid[x, y]) % len(COLORS)]
+            color = _color_for_type(int(grid[x, y]))
             rect = (x * cell_size, y * cell_size, cell_size, cell_size)
             pygame.draw.rect(screen, color, rect)
 
