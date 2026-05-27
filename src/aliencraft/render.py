@@ -1,22 +1,7 @@
-import torch
 import pygame
-import colorsys
 import argparse
 from world import Universe
-
-
-COLORS = [
-    (0, 0, 0),  # empty
-    (78, 121, 167),  # muted blue
-    (89, 161, 79),  # moss
-    (242, 142, 43),  # ochre
-    (225, 87, 89),  # clay
-    (118, 183, 178),  # mineral teal
-    (176, 122, 161),  # mauve
-    (156, 117, 95),  # umber
-    (186, 176, 172),  # stone
-    (237, 201, 72),  # amber
-]
+import torch
 
 
 def render(universe, batch_index=0, cell_size=6):
@@ -51,11 +36,7 @@ def render_animation(universe, steps=10, batch_index=0, cell_size=6, fps=4):
 
 
 def _render_frame(universe, batch_index):
-    noise = universe.render()[batch_index]
-    material_frame = _material_frame(universe, batch_index, noise.shape)
-    base_colors = _palette(int(universe.grid.max().item()) + 1)[material_frame]
-    shade = _shade(noise).unsqueeze(-1)
-    return (base_colors * shade).clamp(0, 255).byte()
+    return universe.get_obs_for_agent()[batch_index].byte()
 
 
 def _draw_frame(screen, frame, cell_size):
@@ -76,37 +57,6 @@ def _make_surface(frame):
 def _make_screen(frame, cell_size):
     height, width = frame.shape[:2]
     return pygame.display.set_mode((width * cell_size, height * cell_size))
-
-
-def _material_frame(universe, batch_index, frame_shape):
-    grid = universe.grid[batch_index].detach().cpu().long()
-    sprite_resolution = universe.sprite_resolution
-    materials = (
-        grid.unsqueeze(-1)
-        .unsqueeze(-1)
-        .expand(*grid.shape, sprite_resolution, sprite_resolution)
-    )
-    return materials.permute(0, 2, 1, 3).reshape(frame_shape)
-
-
-def _shade(noise):
-    noise = noise.detach().cpu().float()
-    noise_min = noise.amin()
-    noise_max = noise.amax()
-    noise = (noise - noise_min) / (noise_max - noise_min + 1e-8)
-    return 0.45 + noise * 0.75
-
-
-def _palette(num_colors):
-    colors = []
-    for cell_type in range(num_colors):
-        if cell_type < len(COLORS):
-            colors.append(COLORS[cell_type])
-        else:
-            hue = (cell_type * 0.61803398875) % 1.0
-            r, g, b = colorsys.hsv_to_rgb(hue, 0.48, 0.68)
-            colors.append((round(r * 255), round(g * 255), round(b * 255)))
-    return torch.tensor(colors, dtype=torch.float32)
 
 
 def _parse_args():
