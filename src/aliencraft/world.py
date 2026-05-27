@@ -109,7 +109,10 @@ class Universe:
             0
         )  # b, sprite_resolution, sprite_resolution, 2
         self.init_sprites()
+        self.create_colour_palette()
+        self.create_actuators()
 
+    def create_actuators(self):
         self.actuators = torch.randn(self.batch_size, 2, 2)
         self.place_type_actuator = torch.randn(
             self.batch_size, self.num_types, self.num_types
@@ -126,6 +129,54 @@ class Universe:
         # test for invertibility, will throw runtime error if not invertible
         self.actuators.inverse()
         self.place_type_actuator.inverse()
+
+    def create_colour_palette(self):
+        colour_palette = (
+            torch.arange(self.num_types) * 0.61803398875
+        ) % 1.0  # num_types
+        colour_palette = colour_palette.unsqueeze(0).expand(
+            self.batch_size, -1
+        )  # b, num_types
+        # permute the colour palette
+        perm = torch.randperm(self.num_types)
+        colour_palette = colour_palette[:, perm]  # b, num_types
+
+        colour_palette = colour_palette.unsqueeze(-1)  # b, num_types, 1
+        saturation_contrast = (
+            torch.tensor([0.48, 0.68])
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .expand(self.batch_size, self.num_types, -1)
+        )  # b, num_types, 2
+
+        hsv = torch.cat(
+            [colour_palette, saturation_contrast], dim=-1
+        )  # b, num_types, 3
+        self.colour_palette = self.hsv_to_rgb(hsv)  # b, num_types, 3
+        self.colour_palette = (
+            (self.colour_palette * 255).floor().long()
+        )  # b, num_types, 3
+
+    def hsv_to_rgb(self, hsv: torch.Tensor):
+        h, s, v = hsv.unbind(-1)
+        i = torch.floor(h * 6).long()
+        f = h * 6 - i
+        p = v * (1 - s)
+        q = v * (1 - f * s)
+        t = v * (1 - (1 - f) * s)
+        choices = torch.stack(
+            [
+                torch.stack([v, t, p], dim=-1),
+                torch.stack([q, v, p], dim=-1),
+                torch.stack([p, v, t], dim=-1),
+                torch.stack([p, q, v], dim=-1),
+                torch.stack([t, p, v], dim=-1),
+                torch.stack([v, p, q], dim=-1),
+            ],
+            dim=-2,
+        )
+        idx = (i % 6).unsqueeze(-1).unsqueeze(-1).expand(*i.shape, 1, 3)
+        return choices.gather(-2, idx).squeeze(-2)
 
     def init_sprites(self):
         perlin = self.perlin(
@@ -152,7 +203,7 @@ class Universe:
         m = torch.max(mat1_type, mat2_type)
         n = torch.min(mat1_type, mat2_type)
         new_type = m * (m + 1) // 2 + n + 1 + self.num_common_types
-        return new_type if new_type < self.num_types else -1  # -1 means invalid type
+        return torch.where(new_type < self.num_types, new_type, -1)
 
     def build_grads(self):
         return torch.tensor(
@@ -271,7 +322,12 @@ class Universe:
 
     def occupany_function(self, grid: torch.Tensor, positions: torch.Tensor):
         is_occupied = (
-            grid[self.batch_idx, positions[..., 0], positions[..., 1]] > 0
+            grid[
+                self.batch_idx.unsqueeze(-1).unsqueeze(-1),
+                positions[..., 0],
+                positions[..., 1],
+            ]
+            > 0
         )  # b, h, w
         is_occupied = is_occupied.unsqueeze(-1)  # b, h, w, 1
         return is_occupied
@@ -286,7 +342,12 @@ class Universe:
         # move the cells that are not occupied to their new positions
         new_positions = new_positions.where(~is_occupied, self.positions)
         is_able_to_move = (
-            grid[self.batch_idx, self.positions[..., 0], self.positions[..., 1]] > 0
+            grid[
+                self.batch_idx.unsqueeze(-1).unsqueeze(-1),
+                self.positions[..., 0],
+                self.positions[..., 1],
+            ]
+            > 0
         )  # b, h, w
         is_able_to_move = is_able_to_move.unsqueeze(-1)  # b, h, w, 1
         new_positions = new_positions.where(is_able_to_move, self.positions)
@@ -296,7 +357,7 @@ class Universe:
         new_positions = new_positions.where(alive.unsqueeze(-1), self.positions)
         # we only want to write cells into positions such that the positions in the original
         # grid were alive
-        b = self.batch_idx.expand_as(grid)
+        b = self.batch_idx.unsqueeze(-1).unsqueeze(-1).expand_as(grid)
         new_grid[
             b[alive], new_positions[..., 0][alive], new_positions[..., 1][alive]
         ] = grid[alive]
@@ -328,12 +389,8 @@ class Universe:
         # then the force is equal to 1/r since it's 2d
         grid_types = self.grid.unsqueeze(-1)  # b, h, w, 1
         types = (
-            torch.arange(self.num_types)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .unsqueeze(0)
-        )  # 1, 1, 1, num_types
+            torch.arange(self.num_types).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        )  # 1, 1, num_types
         grid_types_masked = grid_types == types
         grid = grid_types_masked.squeeze(1).float()  # b, h, w, num_types
         grid = grid.permute(0, 3, 1, 2)  # b, num_types, h, w
@@ -429,7 +486,8 @@ class Universe:
         )  # b,
 
         self.agent_position = self.agent_position.where(
-            motion_mask, self.agent_position + motion_direction
+            motion_mask.unsqueeze(-1),
+            (self.agent_position + motion_direction) % self.width,
         )
 
         type_at_position = self.grid[
@@ -450,7 +508,9 @@ class Universe:
             (self.agent_position[..., 0] + 1) % self.width,
             self.agent_position[..., 1],
         ] = place_type
-        self.grid = torch.where(place_mask, new_grid, self.grid)
+        self.grid = torch.where(
+            place_mask.unsqueeze(-1).unsqueeze(-1), new_grid, self.grid
+        )
 
         # remove the type from the agent's inventory
         self.agent_inventory[self.batch_idx, place_type] = torch.where(
@@ -486,13 +546,15 @@ class Universe:
         new_grid[
             self.batch_idx, self.agent_position[..., 0], self.agent_position[..., 1]
         ] = self.craft(left_type, right_type)
-        new_grid = torch.where(craft_mask, new_grid, self.grid)
+        new_grid = torch.where(
+            craft_mask.unsqueeze(-1).unsqueeze(-1), new_grid, self.grid
+        )
         self.grid = new_grid.where(new_grid != -1, self.grid)
 
     def render(self):
         # render the universe with the sprites
         sprite_grid = self.sprites[
-            self.batch_idx, self.grid
+            self.batch_idx.unsqueeze(-1).unsqueeze(-1), self.grid
         ]  # b, h, w, sprite_resolution, sprite_resolution
         sprite_grid = sprite_grid.permute(
             0, 1, 3, 2, 4
@@ -502,7 +564,40 @@ class Universe:
             self.height * self.sprite_resolution,
             self.width * self.sprite_resolution,
         )  # b, h * sprite_resolution, w * sprite_resolution
+
+        # normalise between 0 and 1
+        amin = sprite_grid.amin(dim=(-2, -1), keepdim=True)
+        amax = sprite_grid.amax(dim=(-2, -1), keepdim=True)
+        sprite_grid = (sprite_grid - amin) / (amax - amin + 1e-8)
         return sprite_grid
+
+    def get_obs_for_agent(self):
+        rendered_grid = self.render()  # b, h * sprite_resolution, w * sprite_resolution
+        rgb_grid = self.colour_palette[
+            self.batch_idx.unsqueeze(-1).unsqueeze(-1), self.grid
+        ]  # b, h, w, 3
+        rgb_grid = rgb_grid.unsqueeze(2).unsqueeze(4)  # b, h, 1, w, 1, 3
+        rgb_grid = rgb_grid.expand(
+            -1, -1, self.sprite_resolution, -1, self.sprite_resolution, -1
+        )  # b, h, sprite_resolution, w, sprite_resolution, 3
+
+        rgb_grid = rgb_grid.reshape(
+            self.batch_size,
+            self.height * self.sprite_resolution,
+            self.width * self.sprite_resolution,
+            3,
+        )  # b, h * sprite_resolution, w * sprite_resolution, 3
+
+        noise = (
+            0.45 + 0.75 * rendered_grid
+        )  # b, h * sprite_resolution, w * sprite_resolution
+        noise = noise.unsqueeze(
+            -1
+        )  # b, h * sprite_resolution, w * sprite_resolution, 1
+        final_colour = (
+            (rgb_grid * noise).clamp(0, 255).floor().long()
+        )  # b, h * sprite_resolution, w * sprite_resolution, 3
+        return final_colour
 
     def step(self, step: int, action=None):
         self.fields = self.step_fields()
@@ -514,7 +609,7 @@ class Universe:
 if __name__ == "__main__":
     torch.inference_mode()
     universe = Universe(
-        batch_size=1,
+        batch_size=2,
         width=10,
         height=10,
         num_types=6,
@@ -529,3 +624,4 @@ if __name__ == "__main__":
         action = torch.randn(1, 2 + universe.num_types)
         universe.step(step, action)
     universe.render()
+    universe.get_obs_for_agent()
