@@ -93,7 +93,9 @@ class Universe:
         self.mass_scale = 5.0
         self.batch_idx = torch.arange(self.batch_size, device=self.grid.device)
 
-        self.agent_position = torch.randint(0, self.width, (self.batch_size, 2))  # b, 2
+        self.agent_position = torch.randint(
+            0, self.width, (self.batch_size, 2)
+        ).long()  # b, 2
         # inventory stores object counts for each type
         self.agent_inventory = torch.zeros(self.batch_size, self.num_types).long()
 
@@ -143,16 +145,14 @@ class Universe:
 
     def craft(
         self,
-        mat1_pos: torch.Tensor,  # b, 2
-        mat2_pos: torch.Tensor,  # b, 2
+        mat1_type: torch.Tensor,  # b,
+        mat2_type: torch.Tensor,  # b,
     ):
-        mat1_type = self.grid[self.batch_idx, mat1_pos[..., 0], mat1_pos[..., 1]]  # b,
-        mat2_type = self.grid[self.batch_idx, mat2_pos[..., 0], mat2_pos[..., 1]]  # b,
         # you craft with two types to get a new type
         m = torch.max(mat1_type, mat2_type)
         n = torch.min(mat1_type, mat2_type)
         new_type = m * (m + 1) // 2 + n + 1 + self.num_common_types
-        return new_type if new_type < self.num_types else None
+        return new_type if new_type < self.num_types else -1  # -1 means invalid type
 
     def build_grads(self):
         return torch.tensor(
@@ -378,27 +378,33 @@ class Universe:
         direction = action[..., :2]  # b, 2
         # type of object to place
         place_type = action[..., 2 : 2 + self.num_types]
-        direction = self.actuators @ direction  # b, 2
+        direction = self.actuators @ direction.unsqueeze(-1)  # b, 2
         direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
-        direction = direction.unsqueeze(-2)  # b, 1, 2
+        direction = direction.squeeze(-1)  # b, 2
 
-        actuated_place_type = self.place_type_actuator @ place_type
+        actuated_place_type = self.place_type_actuator @ place_type.unsqueeze(
+            -1
+        )  # b, num_types
+        actuated_place_type = actuated_place_type.squeeze(-1)
         argmaxxed_place_type = actuated_place_type.argmax(dim=-1)
 
         isqrt2 = 1.0 / math.sqrt(2)
         directions_to_project = torch.tensor(
             [
-                [[1, 0]],
-                [[0, 1]],
-                [[-1, 0]],
-                [[0, -1]],
-                [[isqrt2, isqrt2]],
-                [[isqrt2, -isqrt2]],
-                [[-isqrt2, isqrt2]],
-                [[-isqrt2, -isqrt2]],
+                [1, 0],
+                [0, 1],
+                [-1, 0],
+                [0, -1],
+                [isqrt2, isqrt2],
+                [isqrt2, -isqrt2],
+                [-isqrt2, isqrt2],
+                [-isqrt2, -isqrt2],
             ]
+        ).unsqueeze(
+            0
         )  # 1, 8, 2
-        proj = (direction * directions_to_project).sum(dim=-1)  # b, 8
+
+        proj = (direction.unsqueeze(-2) * directions_to_project).sum(dim=-1)  # b, 8
         argmax_direction = proj.argmax(dim=-1)  # b,
         motion_mask = argmax_direction < 4
         craft_mask = argmax_direction == 4
@@ -409,7 +415,7 @@ class Universe:
             craft_mask,
             pick_mask,
             place_mask,
-            directions_to_project[0, argmax_direction % 4],
+            directions_to_project[0, argmax_direction % 4].long(),
             argmaxxed_place_type,
         )
 
@@ -425,6 +431,7 @@ class Universe:
         self.agent_position = self.agent_position.where(
             motion_mask, self.agent_position + motion_direction
         )
+
         type_at_position = self.grid[
             self.batch_idx, self.agent_position[..., 0], self.agent_position[..., 1]
         ]
@@ -437,6 +444,7 @@ class Universe:
 
         # place the type ahead of the agent
         new_grid = self.grid.clone()
+
         new_grid[
             self.batch_idx,
             (self.agent_position[..., 0] + 1) % self.width,
@@ -478,7 +486,8 @@ class Universe:
         new_grid[
             self.batch_idx, self.agent_position[..., 0], self.agent_position[..., 1]
         ] = self.craft(left_type, right_type)
-        self.grid = torch.where(craft_mask, new_grid, self.grid)
+        new_grid = torch.where(craft_mask, new_grid, self.grid)
+        self.grid = new_grid.where(new_grid != -1, self.grid)
 
     def render(self):
         # render the universe with the sprites
@@ -516,6 +525,7 @@ if __name__ == "__main__":
         sprite_resolution=4,
     )  # create a universe
     universe.seed_universe()
-    for step in range(10):
-        universe.step(step)
+    for step in range(1):
+        action = torch.randn(1, 2 + universe.num_types)
+        universe.step(step, action)
     universe.render()
