@@ -16,6 +16,7 @@ class Universe:
         num_sparse_types: int,
         num_properties: int,
         num_fields: int,
+        sprite_resolution: int,
     ):
         # each cell has a type
         self.width = width
@@ -96,7 +97,7 @@ class Universe:
         # inventory stores object counts for each type
         self.agent_inventory = torch.zeros(self.batch_size, self.num_types).long()
 
-        self.sprite_resolution = 4
+        self.sprite_resolution = sprite_resolution
         ii_sprite, jj_sprite = torch.meshgrid(
             torch.arange(self.sprite_resolution),
             torch.arange(self.sprite_resolution),
@@ -126,7 +127,7 @@ class Universe:
 
     def init_sprites(self):
         perlin = self.perlin(
-            scale=0.1,
+            scale=0.5,
             positions=self.sprite_positions,
             seed=torch.randint(0, 1000000, (self.batch_size * self.num_types,)),
         )
@@ -481,13 +482,24 @@ class Universe:
 
     def render(self):
         # render the universe with the sprites
-        pass
+        sprite_grid = self.sprites[
+            self.batch_idx, self.grid
+        ]  # b, h, w, sprite_resolution, sprite_resolution
+        sprite_grid = sprite_grid.permute(
+            0, 1, 3, 2, 4
+        )  # b, h, sprite_resolution, w, sprite_resolution
+        sprite_grid = sprite_grid.reshape(
+            self.batch_size,
+            self.height * self.sprite_resolution,
+            self.width * self.sprite_resolution,
+        )  # b, h * sprite_resolution, w * sprite_resolution
+        return sprite_grid
 
     def step(self, step: int, action=None):
         self.fields = self.step_fields()
         self.grid = self.step_grid(step)
         if action is not None:
-            self.agent_position = self.apply_action(action)
+            self.apply_action(action)
 
 
 if __name__ == "__main__":
@@ -501,7 +513,9 @@ if __name__ == "__main__":
         num_fields=3,
         num_common_types=2,
         num_sparse_types=2,
+        sprite_resolution=4,
     )  # create a universe
     universe.seed_universe()
     for step in range(10):
         universe.step(step)
+    universe.render()
