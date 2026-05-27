@@ -108,12 +108,21 @@ class Universe:
         self.init_sprites()
 
         self.actuators = torch.randn(self.batch_size, 2, 2)
+        self.place_type_actuator = torch.randn(
+            self.batch_size, self.num_types, self.num_types
+        )
         # make positive semidefinite
         self.actuators = self.actuators @ self.actuators.transpose(
             1, 2
         ) + 1e-4 * torch.eye(2)
+        self.place_type_actuator = (
+            self.place_type_actuator @ self.place_type_actuator.transpose(1, 2)
+            + 1e-4 * torch.eye(self.num_types)
+        )
+
         # test for invertibility, will throw runtime error if not invertible
         self.actuators.inverse()
+        self.place_type_actuator.inverse()
 
     def init_sprites(self):
         perlin = self.perlin(
@@ -366,9 +375,15 @@ class Universe:
         # - craft an object
         # - noop
         direction = action[..., :2]  # b, 2
+        # type of object to place
+        place_type = action[..., 2 : 2 + self.num_types]
         direction = self.actuators @ direction  # b, 2
         direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
         direction = direction.unsqueeze(-2)  # b, 1, 2
+
+        actuated_place_type = self.place_type_actuator @ place_type
+        argmaxxed_place_type = actuated_place_type.argmax(dim=-1)
+
         isqrt2 = 1.0 / math.sqrt(2)
         directions_to_project = torch.tensor(
             [
@@ -394,23 +409,45 @@ class Universe:
             pick_mask,
             place_mask,
             directions_to_project[0, argmax_direction % 4],
+            argmaxxed_place_type,
         )
 
     def apply_action(self, action: torch.Tensor):
-        motion_mask, craft_mask, pick_mask, place_mask, motion_direction = (
+        motion_mask, craft_mask, pick_mask, place_mask, motion_direction, place_type = (
             self.actuator_project(action)
         )
+
+        place_mask = place_mask & (
+            self.agent_inventory[self.batch_idx, place_type] > 0
+        )  # b,
+
         self.agent_position = self.agent_position.where(
             motion_mask, self.agent_position + motion_direction
         )
         type_at_position = self.grid[
             self.batch_idx, self.agent_position[..., 0], self.agent_position[..., 1]
         ]
-        new_agent_inventory = self.agent_inventory.clone()
-        new_agent_inventory[self.batch_idx, type_at_position] = torch.where(
+
+        self.agent_inventory[self.batch_idx, type_at_position] = torch.where(
             pick_mask,
-            new_agent_inventory[self.batch_idx, type_at_position] + 1,
-            new_agent_inventory[self.batch_idx, type_at_position],
+            self.agent_inventory[self.batch_idx, type_at_position] + 1,
+            self.agent_inventory[self.batch_idx, type_at_position],
+        )
+
+        # place the type ahead of the agent
+        new_grid = self.grid.clone()
+        new_grid[
+            self.batch_idx,
+            (self.agent_position[..., 0] + 1) % self.width,
+            self.agent_position[..., 1],
+        ] = place_type
+        self.grid = torch.where(place_mask, new_grid, self.grid)
+
+        # remove the type from the agent's inventory
+        self.agent_inventory[self.batch_idx, place_type] = torch.where(
+            place_mask,
+            self.agent_inventory[self.batch_idx, place_type] - 1,
+            self.agent_inventory[self.batch_idx, place_type],
         )
 
         # for crafting we look at types at either side of the agent's position
@@ -424,9 +461,9 @@ class Universe:
             (self.agent_position[..., 0] + 1) % self.width,
             self.agent_position[..., 1],
         ]
-        new_grid = self.grid.clone()
         # ok so we replace the types at left and right with empty space
         # and add the new type to inventory
+        new_grid = self.grid.clone()
         new_grid[
             self.batch_idx,
             (self.agent_position[..., 0] - 1) % self.width,
@@ -441,8 +478,6 @@ class Universe:
             self.batch_idx, self.agent_position[..., 0], self.agent_position[..., 1]
         ] = self.craft(left_type, right_type)
         self.grid = torch.where(craft_mask, new_grid, self.grid)
-        new_agent_inventory[self.batch_idx, self.craft(left_type, right_type)] += 1
-        self.agent_inventory = new_agent_inventory
 
     def render(self):
         # render the universe with the sprites
