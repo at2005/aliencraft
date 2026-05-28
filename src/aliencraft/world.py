@@ -5,7 +5,7 @@ import math
 import itertools
 
 
-class Universe:
+class AlienCraftWorld(torch.nn.Module):
     def __init__(
         self,
         batch_size: int,
@@ -18,6 +18,7 @@ class Universe:
         num_fields: int,
         sprite_resolution: int,
     ):
+        super().__init__()
         # each cell has a type
         self.width = width
         self.height = height
@@ -650,7 +651,7 @@ class Universe:
 
 if __name__ == "__main__":
     torch.inference_mode()
-    universe = Universe(
+    universe = AlienCraftWorld(
         batch_size=2,
         width=10,
         height=10,

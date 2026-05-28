@@ -8,6 +8,6 @@ from . import world as _world
 
 _sys.modules.setdefault("world", _world)
 
-Universe = _world.Universe
+AlienCraftWorld = _world.AlienCraftWorld
 
-__all__ = ["Universe"]
+__all__ = ["AlienCraftWorld"]
