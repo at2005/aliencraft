@@ -21,6 +21,8 @@ class Universe:
         # each cell has a type
         self.width = width
         self.height = height
+        # for now
+        assert height == width, "height must be equal to width"
         self.num_types = num_types
         self.num_properties = num_properties
         self.num_fields = num_fields
@@ -42,8 +44,8 @@ class Universe:
                 self.field_matter_affinity.weight[active_type_ids]
             ).uniform_(-1.0, 1.0)
 
-        self.num_common_types = 4
-        self.num_sparse_types = 2
+        self.num_common_types = num_common_types
+        self.num_sparse_types = num_sparse_types
 
         assert (
             self.num_common_types + self.num_sparse_types <= self.num_types
@@ -108,9 +110,18 @@ class Universe:
         self.sprite_positions = torch.stack([ii_sprite, jj_sprite], dim=-1).unsqueeze(
             0
         )  # b, sprite_resolution, sprite_resolution, 2
+
+        self.prop_matrix = torch.eye(self.num_properties) + 1e-2 * torch.randn(
+            self.batch_size, self.num_properties, self.num_properties
+        )
+
+        # measures progress down the tech tree, true if the type has been discovered
+        self.tech_tree_progress = torch.zeros(self.batch_size, self.num_types).bool()
+
         self.init_sprites()
         self.create_colour_palette()
         self.create_actuators()
+        self.seed_universe()
 
     def create_actuators(self):
         self.actuators = torch.randn(self.batch_size, 2, 2)
@@ -203,7 +214,16 @@ class Universe:
         m = torch.max(mat1_type, mat2_type)
         n = torch.min(mat1_type, mat2_type)
         new_type = m * (m + 1) // 2 + n + 1 + self.num_common_types
-        return torch.where(new_type < self.num_types, new_type, -1)
+        mat1_props = self.properties[self.batch_idx, mat1_type]
+        mat2_props = self.properties[self.batch_idx, mat2_type]
+        inherited_props: torch.Tensor = self.prop_matrix @ mat1_props.unsqueeze(
+            -1
+        ) + self.prop_matrix @ mat2_props.unsqueeze(-1)
+        inherited_props = inherited_props.squeeze(-1)
+        inherited_props = inherited_props / (
+            inherited_props.norm(dim=-1, keepdim=True) + 1e-8
+        )
+        return torch.where(new_type < self.num_types, new_type, -1), inherited_props
 
     def build_grads(self):
         return torch.tensor(
@@ -486,7 +506,7 @@ class Universe:
         )  # b,
 
         self.agent_position = self.agent_position.where(
-            motion_mask.unsqueeze(-1),
+            ~motion_mask.unsqueeze(-1),
             (self.agent_position + motion_direction) % self.width,
         )
 
@@ -499,6 +519,10 @@ class Universe:
             self.agent_inventory[self.batch_idx, type_at_position] + 1,
             self.agent_inventory[self.batch_idx, type_at_position],
         )
+
+        self.grid[
+            self.batch_idx, self.agent_position[..., 0], self.agent_position[..., 1]
+        ] = torch.where(pick_mask, 0, type_at_position)
 
         # place the type ahead of the agent
         new_grid = self.grid.clone()
@@ -533,22 +557,40 @@ class Universe:
         # ok so we replace the types at left and right with empty space
         # and add the new type to inventory
         new_grid = self.grid.clone()
+        crafted_type, crafted_type_properties = self.craft(left_type, right_type)
+
         new_grid[
             self.batch_idx,
             (self.agent_position[..., 0] - 1) % self.width,
             self.agent_position[..., 1],
-        ] = 0
+        ] = torch.where(crafted_type == -1, left_type, 0)
         new_grid[
             self.batch_idx,
             (self.agent_position[..., 0] + 1) % self.width,
             self.agent_position[..., 1],
-        ] = 0
+        ] = torch.where(crafted_type == -1, right_type, 0)
+
+        already_exists = self.tech_tree_progress[self.batch_idx, crafted_type]
+
+        # condition for marking the type as discovered in the tech tree and updating properties
+        cond = (~already_exists) & (crafted_type != -1) & craft_mask
+        self.properties[self.batch_idx, crafted_type] = torch.where(
+            cond.unsqueeze(-1),
+            crafted_type_properties,
+            self.properties[self.batch_idx, crafted_type],
+        )
+        self.tech_tree_progress[self.batch_idx, crafted_type] = (
+            cond | self.tech_tree_progress[self.batch_idx, crafted_type]
+        )
+
         new_grid[
             self.batch_idx, self.agent_position[..., 0], self.agent_position[..., 1]
-        ] = self.craft(left_type, right_type)
+        ] = crafted_type
+
         new_grid = torch.where(
             craft_mask.unsqueeze(-1).unsqueeze(-1), new_grid, self.grid
         )
+
         self.grid = new_grid.where(new_grid != -1, self.grid)
 
     def render(self):
@@ -619,7 +661,6 @@ if __name__ == "__main__":
         num_sparse_types=2,
         sprite_resolution=4,
     )  # create a universe
-    universe.seed_universe()
     for step in range(1):
         action = torch.randn(1, 2 + universe.num_types)
         universe.step(step, action)

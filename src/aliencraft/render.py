@@ -75,11 +75,11 @@ if __name__ == "__main__":
     torch.inference_mode()
     universe = Universe(
         batch_size=1,
-        width=200,
-        height=200,
-        num_types=10,
-        num_common_types=4,
-        num_sparse_types=2,
+        width=100,
+        height=100,
+        num_types=30,
+        num_common_types=6,
+        num_sparse_types=4,
         num_properties=10,
         num_fields=2,
         sprite_resolution=args.sprite_resolution,
