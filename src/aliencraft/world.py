@@ -17,6 +17,7 @@ class AlienCraftWorld(torch.nn.Module):
         num_properties: int,
         num_fields: int,
         sprite_resolution: int,
+        visual_field_size: int,
     ):
         super().__init__()
         # each cell has a type
@@ -28,7 +29,7 @@ class AlienCraftWorld(torch.nn.Module):
         self.num_properties = num_properties
         self.num_fields = num_fields
         self.batch_size = batch_size
-
+        self.visual_field_size = visual_field_size
         self.grid = torch.zeros(batch_size, width, height)
         self.grid_velocity = torch.zeros(batch_size, width, height, 2)
         # forces are mediated by scalar vfields
@@ -594,31 +595,60 @@ class AlienCraftWorld(torch.nn.Module):
 
         self.grid = new_grid.where(new_grid != -1, self.grid)
 
-    def render(self):
+    def render(self, agent_view=False):
         # render the universe with the sprites
+        ii_nb, jj_nb = torch.meshgrid(
+            torch.arange(self.visual_field_size),
+            torch.arange(self.visual_field_size),
+            indexing="ij",
+        )
+        if agent_view:
+            nb_offsets = torch.stack(
+                [ii_nb, jj_nb], dim=-1
+            )  # (visual_field_size, visual_field_size, 2)
+            nb_offsets = nb_offsets.unsqueeze(0) + self.agent_position.unsqueeze(
+                1
+            ).unsqueeze(
+                1
+            )  # (b, visual_field_size, visual_field_size, 2)
+            nb_offsets = nb_offsets % self.width
+            rows = nb_offsets[..., 0]
+            cols = nb_offsets[..., 1]
+            grid = self.grid[
+                self.batch_idx.unsqueeze(-1).unsqueeze(-1), rows, cols
+            ]  # (b, visual_field_size, visual_field_size)
+        else:
+            grid = self.grid  # (b, h, w)
+
         sprite_grid = self.sprites[
-            self.batch_idx.unsqueeze(-1).unsqueeze(-1), self.grid
+            self.batch_idx.unsqueeze(-1).unsqueeze(-1), grid
         ]  # b, h, w, sprite_resolution, sprite_resolution
+
         sprite_grid = sprite_grid.permute(
             0, 1, 3, 2, 4
         )  # b, h, sprite_resolution, w, sprite_resolution
+
         sprite_grid = sprite_grid.reshape(
             self.batch_size,
-            self.height * self.sprite_resolution,
-            self.width * self.sprite_resolution,
+            grid.shape[-2] * self.sprite_resolution,
+            grid.shape[-1] * self.sprite_resolution,
         )  # b, h * sprite_resolution, w * sprite_resolution
 
         # normalise between 0 and 1
         amin = sprite_grid.amin(dim=(-2, -1), keepdim=True)
         amax = sprite_grid.amax(dim=(-2, -1), keepdim=True)
         sprite_grid = (sprite_grid - amin) / (amax - amin + 1e-8)
-        return sprite_grid
+        return sprite_grid, grid
 
-    def get_obs_for_agent(self):
-        rendered_grid = self.render()  # b, h * sprite_resolution, w * sprite_resolution
+    def get_obs_for_agent(self, agent_view=False):
+        rendered_grid, grid = self.render(
+            agent_view
+        )  # b, h * sprite_resolution, w * sprite_resolution
+
         rgb_grid = self.colour_palette[
-            self.batch_idx.unsqueeze(-1).unsqueeze(-1), self.grid
+            self.batch_idx.unsqueeze(-1).unsqueeze(-1), grid
         ]  # b, h, w, 3
+
         rgb_grid = rgb_grid.unsqueeze(2).unsqueeze(4)  # b, h, 1, w, 1, 3
         rgb_grid = rgb_grid.expand(
             -1, -1, self.sprite_resolution, -1, self.sprite_resolution, -1
@@ -626,8 +656,8 @@ class AlienCraftWorld(torch.nn.Module):
 
         rgb_grid = rgb_grid.reshape(
             self.batch_size,
-            self.height * self.sprite_resolution,
-            self.width * self.sprite_resolution,
+            grid.shape[-2] * self.sprite_resolution,
+            grid.shape[-1] * self.sprite_resolution,
             3,
         )  # b, h * sprite_resolution, w * sprite_resolution, 3
 
@@ -656,6 +686,7 @@ if __name__ == "__main__":
         width=10,
         height=10,
         num_types=6,
+        visual_field_size=3,
         num_properties=10,
         num_fields=3,
         num_common_types=2,
@@ -665,5 +696,5 @@ if __name__ == "__main__":
     for step in range(1):
         action = torch.randn(1, 2 + universe.num_types)
         universe.step(step, action)
-    universe.render()
-    universe.get_obs_for_agent()
+    obs = universe.get_obs_for_agent(agent_view=True)
+    print(obs.shape)

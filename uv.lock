@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.9"
 resolution-markers = [
     "python_full_version >= '3.11'",
@@ -12,6 +12,8 @@ name = "aliencraft"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "black", version = "25.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "black", version = "26.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "torch", version = "2.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "torch", version = "2.12.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
 ]
@@ -34,6 +36,7 @@ render = [
 
 [package.metadata]
 requires-dist = [
+    { name = "black", specifier = ">=25.11.0" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=25.11.0" },
     { name = "matplotlib", marker = "extra == 'render'", specifier = ">=3.9.4" },
     { name = "numpy", marker = "extra == 'render'", specifier = ">=2.0.2" },
