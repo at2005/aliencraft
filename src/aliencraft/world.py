@@ -510,9 +510,9 @@ class AlienCraftWorld(torch.nn.Module):
         direction = action[..., :2]  # b, 2
         # type of object to place
         place_type = action[..., 2 : 2 + self.num_types]
-        direction = self.actuators @ direction.unsqueeze(-1)  # b, 2
-        direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
+        direction = self.actuators @ direction.unsqueeze(-1)  # b, 2, 1
         direction = direction.squeeze(-1)  # b, 2
+        direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
 
         actuated_place_type = self.place_type_actuator @ place_type.unsqueeze(
             -1
@@ -724,11 +724,10 @@ class AlienCraftWorld(torch.nn.Module):
         return final_colour
 
     def step(self, step: int, action=None):
-        self.fields = self.step_fields()
-        self.grid = self.step_grid(step)
         if action is not None:
             self.apply_action(action)
-
+        self.fields = self.step_fields()
+        self.grid = self.step_grid(step)
 
 if __name__ == "__main__":
     torch.inference_mode()
