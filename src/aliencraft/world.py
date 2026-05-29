@@ -18,11 +18,13 @@ class AlienCraftWorld(torch.nn.Module):
         num_fields: int,
         sprite_resolution: int,
         visual_field_size: int,
+        device: str,
     ):
         super().__init__()
         # each cell has a type
         self.width = width
         self.height = height
+        self.device = device
         # for now
         assert height == width, "height must be equal to width"
         self.num_types = num_types
@@ -30,16 +32,24 @@ class AlienCraftWorld(torch.nn.Module):
         self.num_fields = num_fields
         self.batch_size = batch_size
         self.visual_field_size = visual_field_size
-        self.grid = torch.zeros(batch_size, width, height)
-        self.grid_velocity = torch.zeros(batch_size, width, height, 2)
+        self.grid = torch.zeros(batch_size, width, height, device=self.device)
+        self.grid_velocity = torch.zeros(
+            batch_size, width, height, 2, device=self.device
+        )
         # forces are mediated by scalar vfields
-        self.fields = torch.zeros(batch_size, num_fields, width, height)
-        self.field_velocity = torch.zeros(batch_size, num_fields, width, height)
+        self.fields = torch.zeros(
+            batch_size, num_fields, width, height, device=self.device
+        )
+        self.field_velocity = torch.zeros(
+            batch_size, num_fields, width, height, device=self.device
+        )
 
-        self.field_matter_affinity = torch.nn.Embedding(num_types, num_fields)
+        self.field_matter_affinity = torch.nn.Embedding(num_types, num_fields).to(
+            self.device
+        )
         num_active_types = num_types - 1
         assert num_active_types > 0, "num_active_types must be greater than 0"
-        active_type_ids = torch.randperm(num_types)[:num_active_types]
+        active_type_ids = torch.randperm(num_types)[:num_active_types].to(self.device)
         with torch.no_grad():
             self.field_matter_affinity.weight.zero_()
             self.field_matter_affinity.weight[active_type_ids] = torch.empty_like(
@@ -53,7 +63,7 @@ class AlienCraftWorld(torch.nn.Module):
             self.num_common_types + self.num_sparse_types <= self.num_types
         ), "num_common_types + num_sparse_types must be less than num_types"
 
-        self.differential = Differential(num_fields)
+        self.differential = Differential(num_fields).to(self.device)
 
         self.dt = 0.1
         self.field_vel = 1.0
@@ -62,14 +72,20 @@ class AlienCraftWorld(torch.nn.Module):
         self.field_damping = 0.90
 
         ii, jj = torch.meshgrid(
-            torch.arange(self.width), torch.arange(self.height), indexing="ij"
+            torch.arange(self.width, device=self.device),
+            torch.arange(self.height, device=self.device),
+            indexing="ij",
         )
 
         self.positions = torch.stack([ii, jj], dim=-1).unsqueeze(0)  #
 
         self.grads = self.build_grads()
 
-        ii, jj = torch.meshgrid(torch.arange(7), torch.arange(7), indexing="ij")
+        ii, jj = torch.meshgrid(
+            torch.arange(7, device=self.device),
+            torch.arange(7, device=self.device),
+            indexing="ij",
+        )
         positions = torch.stack([ii, jj], dim=-1)  # 7, 7, 2
         distances = (positions[..., 0] - 3) ** 2 + (positions[..., 1] - 3) ** 2
         distances = distances.sqrt()
@@ -84,41 +100,67 @@ class AlienCraftWorld(torch.nn.Module):
             7,
         ), "distance_kernel is not the correct shape"
         self.properties = torch.zeros(
-            self.batch_size, self.num_types, self.num_properties
+            self.batch_size, self.num_types, self.num_properties, device=self.device
         )
 
         self.properties.uniform_(-1.0, 1.0)
 
         # each type affects one field
         self.fields_affected_by_types = torch.randint(
-            0, self.num_fields, (self.batch_size, self.num_types)
+            0, self.num_fields, (self.batch_size, self.num_types), device=self.device
         )  # b, num_types
 
         self.mass_scale = 5.0
-        self.batch_idx = torch.arange(self.batch_size, device=self.grid.device)
+        self.batch_idx = torch.arange(self.batch_size, device=self.device)
 
         self.agent_position = torch.randint(
-            0, self.width, (self.batch_size, 2)
+            0, self.width, (self.batch_size, 2), device=self.device
         ).long()  # b, 2
         # inventory stores object counts for each type
-        self.agent_inventory = torch.zeros(self.batch_size, self.num_types).long()
+        self.agent_inventory = torch.zeros(
+            self.batch_size, self.num_types, device=self.device
+        ).long()
 
         self.sprite_resolution = sprite_resolution
         ii_sprite, jj_sprite = torch.meshgrid(
-            torch.arange(self.sprite_resolution),
-            torch.arange(self.sprite_resolution),
+            torch.arange(self.sprite_resolution, device=self.device),
+            torch.arange(self.sprite_resolution, device=self.device),
             indexing="ij",
         )
         self.sprite_positions = torch.stack([ii_sprite, jj_sprite], dim=-1).unsqueeze(
             0
         )  # b, sprite_resolution, sprite_resolution, 2
 
-        self.prop_matrix = torch.eye(self.num_properties) + 1e-2 * torch.randn(
-            self.batch_size, self.num_properties, self.num_properties
+        self.prop_matrix = torch.eye(
+            self.num_properties, device=self.device
+        ) + 1e-2 * torch.randn(
+            self.batch_size,
+            self.num_properties,
+            self.num_properties,
+            device=self.device,
         )
 
         # measures progress down the tech tree, true if the type has been discovered
-        self.tech_tree_progress = torch.zeros(self.batch_size, self.num_types).bool()
+        self.tech_tree_progress = torch.zeros(
+            self.batch_size, self.num_types, device=self.device
+        ).bool()
+
+        assert (
+            self.visual_field_size % self.sprite_resolution == 0
+        ), "visual_field_size must be divisible by sprite_resolution"
+        ii_nb, jj_nb = torch.meshgrid(
+            torch.arange(
+                self.visual_field_size // self.sprite_resolution, device=self.device
+            ),
+            torch.arange(
+                self.visual_field_size // self.sprite_resolution, device=self.device
+            ),
+            indexing="ij",
+        )
+        nb_offsets = torch.stack(
+            [ii_nb, jj_nb], dim=-1
+        )  # (visual_field_size // sprite_res, visual_field_size // sprite_res, 2)
+        self.register_buffer("nb_offsets", nb_offsets, persistent=False)
 
         self.init_sprites()
         self.create_colour_palette()
@@ -126,17 +168,17 @@ class AlienCraftWorld(torch.nn.Module):
         self.seed_universe()
 
     def create_actuators(self):
-        self.actuators = torch.randn(self.batch_size, 2, 2)
+        self.actuators = torch.randn(self.batch_size, 2, 2, device=self.device)
         self.place_type_actuator = torch.randn(
-            self.batch_size, self.num_types, self.num_types
+            self.batch_size, self.num_types, self.num_types, device=self.device
         )
         # make positive semidefinite
         self.actuators = self.actuators @ self.actuators.transpose(
             1, 2
-        ) + 1e-4 * torch.eye(2)
+        ) + 1e-4 * torch.eye(2, device=self.device)
         self.place_type_actuator = (
             self.place_type_actuator @ self.place_type_actuator.transpose(1, 2)
-            + 1e-4 * torch.eye(self.num_types)
+            + 1e-4 * torch.eye(self.num_types, device=self.device)
         )
 
         # test for invertibility, will throw runtime error if not invertible
@@ -145,7 +187,7 @@ class AlienCraftWorld(torch.nn.Module):
 
     def create_colour_palette(self):
         colour_palette = (
-            torch.arange(self.num_types) * 0.61803398875
+            torch.arange(self.num_types, device=self.device) * 0.61803398875
         ) % 1.0  # num_types
         colour_palette = colour_palette.unsqueeze(0).expand(
             self.batch_size, -1
@@ -156,7 +198,7 @@ class AlienCraftWorld(torch.nn.Module):
 
         colour_palette = colour_palette.unsqueeze(-1)  # b, num_types, 1
         saturation_contrast = (
-            torch.tensor([0.48, 0.68])
+            torch.tensor([0.48, 0.68], device=self.device)
             .unsqueeze(0)
             .unsqueeze(0)
             .expand(self.batch_size, self.num_types, -1)
@@ -195,7 +237,9 @@ class AlienCraftWorld(torch.nn.Module):
         perlin = self.perlin(
             scale=0.5,
             positions=self.sprite_positions,
-            seed=torch.randint(0, 1000000, (self.batch_size * self.num_types,)),
+            seed=torch.randint(
+                0, 1000000, (self.batch_size * self.num_types,), device=self.device
+            ),
         )
 
         perlin = perlin.reshape(
@@ -239,6 +283,8 @@ class AlienCraftWorld(torch.nn.Module):
                 [-1 / math.sqrt(2), 1 / math.sqrt(2)],
                 [-1 / math.sqrt(2), -1 / math.sqrt(2)],
             ]
+        ).to(
+            self.device
         )  # 8, 2
 
     def quintic_smoothing(self, t):
@@ -300,7 +346,7 @@ class AlienCraftWorld(torch.nn.Module):
     def seed_universe(self):
         fields = []
         for i in range(self.num_common_types):
-            seed = torch.randint(0, 1000000, (self.batch_size,))
+            seed = torch.randint(0, 1000000, (self.batch_size,), device=self.device)
             perlin = self.perlin(
                 scale=0.05 / (0.5 * math.sqrt(i + 1)),
                 positions=self.positions,
@@ -314,25 +360,29 @@ class AlienCraftWorld(torch.nn.Module):
         fields = torch.stack(fields, dim=-1)  # b, h, w, num_types
         grid = fields.argmax(dim=-1)  # b, h, w
 
-        sparse_mask = torch.rand(self.batch_size, self.width, self.height) < 0.01
+        sparse_mask = (
+            torch.rand(self.batch_size, self.width, self.height, device=self.device)
+            < 0.01
+        )
         rare_types = torch.randint(
             self.num_common_types,
             self.num_common_types + self.num_sparse_types,
             (self.batch_size, self.width, self.height),
+            device=self.device,
         )  # b, h, w
         grid[sparse_mask] = rare_types[sparse_mask]
 
         self.grid = grid
 
-        I = torch.eye(4)
-        perms = torch.tensor(list(itertools.permutations(range(4))))
+        I = torch.eye(4, device=self.device)
+        perms = torch.tensor(list(itertools.permutations(range(4))), device=self.device)
         self.permutation_matrices = I[perms]
 
     def block_rule(self, blocks: torch.Tensor):
         blocks = blocks.reshape(
             blocks.shape[0], blocks.shape[1], blocks.shape[2], -1
         )  # b, h//2, w//2, 4
-        weights = torch.tensor([1, 4, 8, 16])
+        weights = torch.tensor([1, 4, 8, 16], device=self.device)
         mod_blocks = (blocks * weights).sum(dim=-1) % 24  # b, h//2, w//2
         perm_matrix = self.permutation_matrices[mod_blocks]
         blocks = perm_matrix.float() @ blocks.unsqueeze(-1).float()
@@ -411,7 +461,10 @@ class AlienCraftWorld(torch.nn.Module):
         # then the force is equal to 1/r since it's 2d
         grid_types = self.grid.unsqueeze(-1)  # b, h, w, 1
         types = (
-            torch.arange(self.num_types).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            torch.arange(self.num_types, device=self.device)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .unsqueeze(0)
         )  # 1, 1, num_types
         grid_types_masked = grid_types == types
         grid = grid_types_masked.squeeze(1).float()  # b, h, w, num_types
@@ -597,16 +650,8 @@ class AlienCraftWorld(torch.nn.Module):
 
     def render(self, agent_view=False):
         # render the universe with the sprites
-        ii_nb, jj_nb = torch.meshgrid(
-            torch.arange(self.visual_field_size),
-            torch.arange(self.visual_field_size),
-            indexing="ij",
-        )
         if agent_view:
-            nb_offsets = torch.stack(
-                [ii_nb, jj_nb], dim=-1
-            )  # (visual_field_size, visual_field_size, 2)
-            nb_offsets = nb_offsets.unsqueeze(0) + self.agent_position.unsqueeze(
+            nb_offsets = self.nb_offsets.unsqueeze(0) + self.agent_position.unsqueeze(
                 1
             ).unsqueeze(
                 1
@@ -640,7 +685,7 @@ class AlienCraftWorld(torch.nn.Module):
         sprite_grid = (sprite_grid - amin) / (amax - amin + 1e-8)
         return sprite_grid, grid
 
-    def get_obs_for_agent(self, agent_view=False):
+    def get_obs_for_agent(self, agent_view=False, normalise=False):
         rendered_grid, grid = self.render(
             agent_view
         )  # b, h * sprite_resolution, w * sprite_resolution
@@ -670,6 +715,11 @@ class AlienCraftWorld(torch.nn.Module):
         final_colour = (
             (rgb_grid * noise).clamp(0, 255).floor().long()
         )  # b, h * sprite_resolution, w * sprite_resolution, 3
+
+        if normalise:
+            # normalise betwee 0 and 1
+            final_colour = final_colour / 255.0
+
         return final_colour
 
     def step(self, step: int, action=None):
