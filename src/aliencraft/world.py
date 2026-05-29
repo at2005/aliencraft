@@ -531,7 +531,8 @@ class AlienCraftWorld(torch.nn.Module):
                 [isqrt2, -isqrt2],
                 [-isqrt2, isqrt2],
                 [-isqrt2, -isqrt2],
-            ]
+            ],
+            device=self.device,
         ).unsqueeze(
             0
         )  # 1, 8, 2
