@@ -47,7 +47,7 @@ class AlienCraftWorld(torch.nn.Module):
         self.field_matter_affinity = torch.nn.Embedding(num_types, num_fields).to(
             self.device
         )
-        num_active_types = num_types - 1
+        num_active_types = num_types // 2
         assert num_active_types > 0, "num_active_types must be greater than 0"
         active_type_ids = torch.randperm(num_types)[:num_active_types].to(self.device)
         with torch.no_grad():
@@ -373,24 +373,6 @@ class AlienCraftWorld(torch.nn.Module):
         grid[sparse_mask] = rare_types[sparse_mask]
 
         self.grid = grid
-
-        I = torch.eye(4, device=self.device)
-        perms = torch.tensor(list(itertools.permutations(range(4))), device=self.device)
-        self.permutation_matrices = I[perms]
-
-    def block_rule(self, blocks: torch.Tensor):
-        blocks = blocks.reshape(
-            blocks.shape[0], blocks.shape[1], blocks.shape[2], -1
-        )  # b, h//2, w//2, 4
-        weights = torch.tensor([1, 4, 8, 16], device=self.device)
-        mod_blocks = (blocks * weights).sum(dim=-1) % 24  # b, h//2, w//2
-        perm_matrix = self.permutation_matrices[mod_blocks]
-        blocks = perm_matrix.float() @ blocks.unsqueeze(-1).float()
-        blocks = blocks.squeeze(-1)
-        blocks = blocks.view(
-            blocks.shape[0], blocks.shape[1], blocks.shape[2], 2, 2
-        ).long()
-        return blocks
 
     def occupany_function(self, grid: torch.Tensor, positions: torch.Tensor):
         is_occupied = (
@@ -728,6 +710,72 @@ class AlienCraftWorld(torch.nn.Module):
             self.apply_action(action)
         self.fields = self.step_fields()
         self.grid = self.step_grid(step)
+
+    def reset(self):
+        with torch.no_grad():
+            self.grid = torch.zeros(
+                self.batch_size, self.width, self.height, device=self.device
+            )
+            self.grid_velocity = torch.zeros(
+                self.batch_size, self.width, self.height, 2, device=self.device
+            )
+            self.fields = torch.zeros(
+                self.batch_size,
+                self.num_fields,
+                self.width,
+                self.height,
+                device=self.device,
+            )
+            self.tech_tree_progress = torch.zeros(
+                self.batch_size, self.num_types, device=self.device
+            ).bool()
+            self.field_velocity = torch.zeros(
+                self.batch_size,
+                self.num_fields,
+                self.width,
+                self.height,
+                device=self.device,
+            )
+            self.field_matter_affinity.weight.zero_()
+            self.properties = torch.zeros(
+                self.batch_size, self.num_types, self.num_properties, device=self.device
+            )
+            self.properties.uniform_(-1.0, 1.0)
+            self.prop_matrix = torch.eye(
+                self.num_properties, device=self.device
+            ) + 1e-2 * torch.randn(
+                self.batch_size,
+                self.num_properties,
+                self.num_properties,
+                device=self.device,
+            )
+
+            num_active_types = self.num_types // 2
+            assert num_active_types > 0, "num_active_types must be greater than 0"
+            active_type_ids = torch.randperm(self.num_types)[:num_active_types].to(
+                self.device
+            )
+            self.field_matter_affinity.weight[active_type_ids] = torch.empty_like(
+                self.field_matter_affinity.weight[active_type_ids]
+            ).uniform_(-1.0, 1.0)
+            self.fields_affected_by_types = torch.randint(
+                0,
+                self.num_fields,
+                (self.batch_size, self.num_types),
+                device=self.device,
+            )  # b, num_types
+            self.agent_position = torch.randint(
+                0, self.width, (self.batch_size, 2), device=self.device
+            ).long()
+            self.agent_inventory = torch.zeros(
+                self.batch_size, self.num_types, device=self.device
+            ).long()
+
+            self.init_sprites()
+            self.create_colour_palette()
+            self.create_actuators()
+            self.seed_universe()
+
 
 if __name__ == "__main__":
     torch.inference_mode()
