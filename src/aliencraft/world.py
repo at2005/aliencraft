@@ -551,6 +551,7 @@ class AlienCraftWorld(torch.nn.Module):
         type_at_position = self.grid[
             self.batch_idx, self.agent_position[..., 0], self.agent_position[..., 1]
         ]
+        pick_mask = pick_mask & (type_at_position > 0)
 
         self.agent_inventory[self.batch_idx, type_at_position] = torch.where(
             pick_mask,
