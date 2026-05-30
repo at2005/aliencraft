@@ -47,7 +47,7 @@ class AlienCraftWorld(torch.nn.Module):
         self.field_matter_affinity = torch.nn.Embedding(num_types, num_fields).to(
             self.device
         )
-        num_active_types = num_types // 2
+        num_active_types = num_types - 1
         assert num_active_types > 0, "num_active_types must be greater than 0"
         active_type_ids = torch.randperm(num_types)[:num_active_types].to(self.device)
         with torch.no_grad():
@@ -66,7 +66,7 @@ class AlienCraftWorld(torch.nn.Module):
         self.differential = Differential(num_fields).to(self.device)
 
         self.dt = 0.1
-        self.field_vel = 1.0
+        self.field_vel = torch.randint(1, 3, (self.batch_size, self.num_fields), device=self.device).float() # b, num_fields
 
         self.damping = 0.90
         self.field_damping = 0.90
@@ -435,7 +435,7 @@ class AlienCraftWorld(torch.nn.Module):
 
     def step_fields(self):
         # wave propagation for now
-        delta_fields = (self.field_vel**2) * self.differential.laplacian(self.fields)
+        delta_fields = self.field_vel.pow(2).unsqueeze(-1).unsqueeze(-1) * self.differential.laplacian(self.fields) # b, num_fields, h, w
         # compute distance r from source types and populate fields
         # we compute distance from each source type to everywhere else in the grid
         # then the field value is the sum of the fields from all source types at that distance
