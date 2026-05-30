@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 from differential import Differential
 import math
-import itertools
 
 
 class AlienCraftWorld(torch.nn.Module):
@@ -20,6 +19,7 @@ class AlienCraftWorld(torch.nn.Module):
         visual_field_size: int,
         device: str,
         driven_fields: bool = False,
+        actuator_random: bool = False,
     ):
         super().__init__()
         # each cell has a type
@@ -34,6 +34,7 @@ class AlienCraftWorld(torch.nn.Module):
         self.batch_size = batch_size
         self.visual_field_size = visual_field_size
         self.driven_fields = driven_fields
+        self.actuator_random = actuator_random
         self.grid = torch.zeros(batch_size, width, height, device=self.device)
         self.grid_velocity = torch.zeros(
             batch_size, width, height, 2, device=self.device
@@ -172,6 +173,11 @@ class AlienCraftWorld(torch.nn.Module):
         self.seed_universe()
 
     def create_actuators(self):
+        if not self.actuator_random:
+            self.actuators = torch.eye(2, device=self.device).unsqueeze(0).expand(self.batch_size, -1, -1)
+            self.place_type_actuator = torch.eye(self.num_types, device=self.device).unsqueeze(0).expand(self.batch_size, -1, -1)
+            return
+
         self.actuators = torch.randn(self.batch_size, 2, 2, device=self.device)
         self.place_type_actuator = torch.randn(
             self.batch_size, self.num_types, self.num_types, device=self.device
