@@ -19,6 +19,7 @@ class AlienCraftWorld(torch.nn.Module):
         sprite_resolution: int,
         visual_field_size: int,
         device: str,
+        driven_fields: bool = False,
     ):
         super().__init__()
         # each cell has a type
@@ -32,6 +33,7 @@ class AlienCraftWorld(torch.nn.Module):
         self.num_fields = num_fields
         self.batch_size = batch_size
         self.visual_field_size = visual_field_size
+        self.driven_fields = driven_fields
         self.grid = torch.zeros(batch_size, width, height, device=self.device)
         self.grid_velocity = torch.zeros(
             batch_size, width, height, 2, device=self.device
@@ -66,7 +68,9 @@ class AlienCraftWorld(torch.nn.Module):
         self.differential = Differential(num_fields).to(self.device)
 
         self.dt = 0.1
-        self.field_vel = torch.randint(1, 3, (self.batch_size, self.num_fields), device=self.device).float() # b, num_fields
+        self.field_vel = torch.randint(
+            1, 3, (self.batch_size, self.num_fields), device=self.device
+        ).float()  # b, num_fields
 
         self.damping = 0.90
         self.field_damping = 0.90
@@ -435,7 +439,11 @@ class AlienCraftWorld(torch.nn.Module):
 
     def step_fields(self):
         # wave propagation for now
-        delta_fields = self.field_vel.pow(2).unsqueeze(-1).unsqueeze(-1) * self.differential.laplacian(self.fields) # b, num_fields, h, w
+        delta_fields = self.field_vel.pow(2).unsqueeze(-1).unsqueeze(
+            -1
+        ) * self.differential.laplacian(
+            self.fields
+        )  # b, num_fields, h, w
         # compute distance r from source types and populate fields
         # we compute distance from each source type to everywhere else in the grid
         # then the field value is the sum of the fields from all source types at that distance
@@ -454,9 +462,11 @@ class AlienCraftWorld(torch.nn.Module):
 
         # so we have a deconstructed map of types in each cell
         # we now compute a convolution of each type with a kernel that captures the distance from each type
-        grid = F.conv2d(
-            grid, self.distance_kernel, padding=3, groups=self.num_types
-        )  # b, num_types, h, w
+
+        if self.driven_fields:
+            grid = F.conv2d(
+                grid, self.distance_kernel, padding=3, groups=self.num_types
+            )  # b, num_types, h, w
 
         mass_equivalent = self.mass_scale * (
             self.properties[..., 0].unsqueeze(-1).unsqueeze(-1)
