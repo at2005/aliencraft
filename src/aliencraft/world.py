@@ -73,7 +73,7 @@ class AlienCraftWorld(torch.nn.Module):
         ).float()  # b, num_fields
 
         self.damping = 0.90
-        self.field_damping = 0.90
+        self.field_damping = 1.0
 
         ii, jj = torch.meshgrid(
             torch.arange(self.width, device=self.device),
