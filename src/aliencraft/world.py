@@ -5,6 +5,30 @@ import math
 
 
 class AlienCraftWorld(torch.nn.Module):
+    RELOAD_BUFFER_NAMES = (
+        "grid",
+        "grid_velocity",
+        "fields",
+        "field_velocity",
+        "field_vel",
+        "positions",
+        "grads",
+        "distance_kernel",
+        "properties",
+        "fields_affected_by_types",
+        "batch_idx",
+        "agent_position",
+        "agent_inventory",
+        "sprite_positions",
+        "prop_matrix",
+        "tech_tree_progress",
+        "nb_offsets",
+        "sprites",
+        "colour_palette",
+        "actuators",
+        "place_type_actuator",
+    )
+
     def __init__(
         self,
         batch_size: int,
@@ -172,10 +196,42 @@ class AlienCraftWorld(torch.nn.Module):
         self.create_actuators()
         self.seed_universe()
 
+        self.initial_grid_copy = self.grid.detach().clone()
+        self.initial_agent_position = self.agent_position.detach().clone()
+
+    def register_all_buffers(self):
+        for name in self.RELOAD_BUFFER_NAMES:
+            if not hasattr(self, name):
+                continue
+
+            value = getattr(self, name)
+            if not isinstance(value, torch.Tensor):
+                continue
+
+            value = value.detach().clone().contiguous()
+            if name in self._buffers:
+                self._buffers[name] = value
+                self._non_persistent_buffers_set.discard(name)
+                continue
+
+            if name in self.__dict__:
+                del self.__dict__[name]
+            self.register_buffer(name, value, persistent=True)
+
+        return self
+
     def create_actuators(self):
         if not self.actuator_random:
-            self.actuators = torch.eye(2, device=self.device).unsqueeze(0).expand(self.batch_size, -1, -1)
-            self.place_type_actuator = torch.eye(self.num_types, device=self.device).unsqueeze(0).expand(self.batch_size, -1, -1)
+            self.actuators = (
+                torch.eye(2, device=self.device)
+                .unsqueeze(0)
+                .expand(self.batch_size, -1, -1)
+            )
+            self.place_type_actuator = (
+                torch.eye(self.num_types, device=self.device)
+                .unsqueeze(0)
+                .expand(self.batch_size, -1, -1)
+            )
             return
 
         self.actuators = torch.randn(self.batch_size, 2, 2, device=self.device)
@@ -258,6 +314,11 @@ class AlienCraftWorld(torch.nn.Module):
             self.sprite_resolution,
             self.sprite_resolution,
         )  # b, num_types, sprite_resolution, sprite_resolution
+
+        # normalise between 0 and 1
+        amin = perlin.amin(dim=(-2, -1), keepdim=True)
+        amax = perlin.amax(dim=(-2, -1), keepdim=True)
+        perlin = (perlin - amin) / (amax - amin + 1e-8)
 
         self.sprites = perlin
 
@@ -679,10 +740,6 @@ class AlienCraftWorld(torch.nn.Module):
             grid.shape[-1] * self.sprite_resolution,
         )  # b, h * sprite_resolution, w * sprite_resolution
 
-        # normalise between 0 and 1
-        amin = sprite_grid.amin(dim=(-2, -1), keepdim=True)
-        amax = sprite_grid.amax(dim=(-2, -1), keepdim=True)
-        sprite_grid = (sprite_grid - amin) / (amax - amin + 1e-8)
         return sprite_grid, grid
 
     def get_obs_for_agent(self, agent_view=False, normalise=False):
@@ -728,13 +785,22 @@ class AlienCraftWorld(torch.nn.Module):
         self.fields = self.step_fields()
         self.grid = self.step_grid(step)
 
+    def reset_velocities(self):
+        self.grid_velocity = torch.zeros(
+            self.batch_size, self.width, self.height, 2, device=self.device
+        )
+        self.field_velocity = torch.zeros(
+            self.batch_size,
+            self.num_fields,
+            self.width,
+            self.height,
+            device=self.device,
+        )
+
     def reset(self):
         with torch.no_grad():
             self.grid = torch.zeros(
                 self.batch_size, self.width, self.height, device=self.device
-            )
-            self.grid_velocity = torch.zeros(
-                self.batch_size, self.width, self.height, 2, device=self.device
             )
             self.fields = torch.zeros(
                 self.batch_size,
@@ -743,16 +809,10 @@ class AlienCraftWorld(torch.nn.Module):
                 self.height,
                 device=self.device,
             )
+            self.reset_velocities()
             self.tech_tree_progress = torch.zeros(
                 self.batch_size, self.num_types, device=self.device
             ).bool()
-            self.field_velocity = torch.zeros(
-                self.batch_size,
-                self.num_fields,
-                self.width,
-                self.height,
-                device=self.device,
-            )
             self.field_matter_affinity.weight.zero_()
             self.properties = torch.zeros(
                 self.batch_size, self.num_types, self.num_properties, device=self.device
