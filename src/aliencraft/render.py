@@ -1,4 +1,5 @@
 import argparse
+import math
 import sys
 import types
 from pathlib import Path
@@ -12,6 +13,8 @@ except ImportError:
     from world import AlienCraftWorld as Universe
 
 ALIEN_DIR = Path(__file__).resolve().parents[3] / "alien"
+ENV_STATE_PATH = ALIEN_DIR / "env_state.pth"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(ALIEN_DIR))
 from config import load_world_model_config
 
@@ -54,7 +57,7 @@ def _install_world_model_import_stubs():
 
 def _import_world_model():
     try:
-        from world_model import WorldModel, load_model_state
+        from world_model import WorldModel, load_model_state, load_universe
     except ModuleNotFoundError as exc:
         if exc.name not in {"posix_ipc", "wandb", "tqdm"}:
             raise
@@ -68,7 +71,7 @@ def _import_world_model():
         _install_world_model_import_stubs()
         return _load_world_model_from_source()
 
-    return WorldModel, load_model_state
+    return WorldModel, load_model_state, load_universe
 
 
 def _load_world_model_from_source():
@@ -83,14 +86,15 @@ def _load_world_model_from_source():
         "exec",
     )
     exec(code, module.__dict__)
-    return module.WorldModel, module.load_model_state
+    return module.WorldModel, module.load_model_state, module.load_universe
 
 
-WorldModel, load_model_state = _import_world_model()
+WorldModel, load_model_state, load_universe = _import_world_model()
+_MANUAL_WAIT = object()
 
 TRAINING_UNIVERSE_KWARGS = {
-    "width": 128,
-    "height": 128,
+    "width": 2048,
+    "height": 2048,
     "num_types": 20,
     "num_properties": 10,
     "num_fields": 3,
@@ -119,6 +123,72 @@ def _load_checkpoint_policy(device):
     return policy, config, state
 
 
+def _load_torch_state_dict(path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def _infer_universe_kwargs_from_state(config, state_dict):
+    if "grid" not in state_dict:
+        raise ValueError("environment state checkpoint is missing 'grid'")
+    if "properties" not in state_dict:
+        raise ValueError("environment state checkpoint is missing 'properties'")
+    if "fields" not in state_dict:
+        raise ValueError("environment state checkpoint is missing 'fields'")
+
+    grid = state_dict["grid"]
+    properties = state_dict["properties"]
+    fields = state_dict["fields"]
+    if grid.ndim != 3:
+        raise ValueError(f"expected 'grid' to have 3 dims, got {tuple(grid.shape)}")
+    if properties.ndim != 3:
+        raise ValueError(
+            f"expected 'properties' to have 3 dims, got {tuple(properties.shape)}"
+        )
+    if fields.ndim != 4:
+        raise ValueError(f"expected 'fields' to have 4 dims, got {tuple(fields.shape)}")
+
+    batch_size, width, height = grid.shape
+    _, num_types, num_properties = properties.shape
+    _, num_fields, _, _ = fields.shape
+
+    if "sprite_positions" in state_dict:
+        sprite_resolution = state_dict["sprite_positions"].shape[1]
+    elif "sprites" in state_dict:
+        sprite_resolution = state_dict["sprites"].shape[2]
+    else:
+        raise ValueError(
+            "environment state checkpoint is missing sprite resolution tensors"
+        )
+
+    if "nb_offsets" in state_dict:
+        visual_field_size = state_dict["nb_offsets"].shape[0] * sprite_resolution
+    else:
+        visual_field_size = config.visual_field_size
+
+    num_common_types = min(TRAINING_UNIVERSE_KWARGS["num_common_types"], num_types)
+    num_sparse_types = min(
+        TRAINING_UNIVERSE_KWARGS["num_sparse_types"],
+        max(0, num_types - num_common_types),
+    )
+
+    kwargs = {
+        "batch_size": batch_size,
+        "width": width,
+        "height": height,
+        "num_types": num_types,
+        "num_properties": num_properties,
+        "num_fields": num_fields,
+        "num_common_types": num_common_types,
+        "num_sparse_types": num_sparse_types,
+        "visual_field_size": visual_field_size,
+        "sprite_resolution": sprite_resolution,
+    }
+    return kwargs
+
+
 def _make_training_universe(config, device, sprite_resolution, batch_size=1):
     return Universe(
         batch_size=batch_size,
@@ -129,19 +199,77 @@ def _make_training_universe(config, device, sprite_resolution, batch_size=1):
     )
 
 
-def _policy_action(policy, state, universe):
+def _make_env_state_universe(config, device, checkpoint_path):
+    state_dict = _load_torch_state_dict(checkpoint_path, map_location=device)
+    if not isinstance(state_dict, dict):
+        raise ValueError(
+            f"expected {checkpoint_path} to contain a state dict, got "
+            f"{type(state_dict).__name__}"
+        )
+
+    universe_kwargs = _infer_universe_kwargs_from_state(config, state_dict)
+    universe = Universe(device=device, **universe_kwargs)
+    return load_universe(universe, str(checkpoint_path), map_location=device)
+
+
+def _update_policy_state(policy, state, universe):
     obs = universe.get_obs_for_agent(agent_view=True, normalise=True)
     state["recurrent"] = policy.update_recurrent_state(
         state["prev_action"], state["latent"], state["recurrent"]
     )
     obs_embedding = policy.embed_observation(obs)
     state["latent"], _ = policy.sample_latent(obs_embedding, state["recurrent"])
+
+
+def _policy_action(policy, state):
     action_mean, action_std = policy.get_action_params(
         state["latent"], state["recurrent"]
     )
-    action = torch.distributions.Normal(action_mean, action_std).sample()
-    state["prev_action"] = action
-    return action
+    return torch.distributions.Normal(action_mean, action_std).sample()
+
+
+def _decode_latent_frame(policy, latent, recurrent, batch_index):
+    decoded = policy.decode_latent(latent, recurrent)
+    return decoded[batch_index].detach().float().clamp(0, 1).mul(255).byte()
+
+
+def _advance_dream(policy, state, universe, action, batch_index, show_posterior):
+    prev_action = (
+        action if action is not None else torch.zeros_like(state["prev_action"])
+    )
+    state["recurrent"] = policy.update_recurrent_state(
+        prev_action, state["latent"], state["recurrent"]
+    )
+    prior_latent, _ = policy.get_next_latent_prediction(state["recurrent"])
+    prior_frame = _decode_latent_frame(
+        policy, prior_latent, state["recurrent"], batch_index
+    )
+
+    if show_posterior:
+        obs = universe.get_obs_for_agent(agent_view=True, normalise=True)
+        true_frame = obs[batch_index].detach().float().clamp(0, 1).mul(255).byte()
+        obs_embedding = policy.embed_observation(obs)
+        posterior_latent_for_state, posterior_distribution = policy.sample_latent(
+            obs_embedding, state["recurrent"]
+        )
+        posterior_frame = _decode_latent_frame(
+            policy, posterior_distribution.mean, state["recurrent"], batch_index
+        )
+        frame = torch.cat([prior_frame, posterior_frame, true_frame], dim=1)
+        state["latent"] = posterior_latent_for_state
+    else:
+        frame = prior_frame
+        state["latent"] = prior_latent
+    return frame
+
+
+def _initial_frame(universe, batch_index, policy=None, dream=False, show_posterior=False):
+    if dream:
+        frame = universe.get_obs_for_agent(agent_view=True)[batch_index].byte()
+        if show_posterior:
+            return torch.cat([frame, frame, frame], dim=1)
+        return frame
+    return _render_frame(universe, batch_index)
 
 
 def _describe_action(universe, action):
@@ -182,42 +310,95 @@ def render_animation(
     steps=10,
     batch_index=0,
     cell_size=6,
-    fps=4,
+    fps=12,
     policy=None,
     state=None,
     random_actions=False,
+    manual_actions=False,
+    dream=False,
+    show_posterior=False,
 ):
     pygame.init()
-    frame = _render_frame(universe, batch_index)
+    if dream and (policy is None or state is None):
+        raise ValueError("--dream requires a checkpoint policy")
+    frame = _initial_frame(universe, batch_index, policy, dream, show_posterior)
     screen = _make_screen(frame, cell_size)
+    _draw_frame(screen, frame, cell_size)
+    _draw_inventory(screen, universe, batch_index, 0)
+    pygame.display.flip()
     clock = pygame.time.Clock()
     registered_crafts = 0
+    manual_state = {"selected_place_type": 0}
+    step = 0
 
-    for step in range(1, steps + 1):
-        for event in pygame.event.get():
+    if dream:
+        _update_policy_state(policy, state, universe)
+
+    while step < steps:
+        events = pygame.event.get()
+        for event in events:
             if event.type == pygame.QUIT:
                 pygame.quit()
                 return
 
-        if random_actions:
+        if policy is not None and not dream:
+            _update_policy_state(policy, state, universe)
+
+        if manual_actions:
+            action = _manual_action_from_input(universe, events, manual_state)
+            if action is _MANUAL_WAIT:
+                caption = (
+                    f"aliencraft step {step} | {_describe_agent_position(universe)}"
+                )
+                if dream:
+                    caption += " | dream"
+                    if show_posterior:
+                        caption += " | prior/posterior/true"
+                caption += (
+                    f" | manual place={manual_state['selected_place_type']}"
+                    " | waiting"
+                )
+                pygame.display.set_caption(caption)
+                clock.tick(fps)
+                continue
+        elif random_actions:
             action = torch.randn(1, 2 + universe.num_types, device=universe.device)
         elif policy is not None:
-            action = _policy_action(policy, state, universe)
+            action = _policy_action(policy, state)
         else:
             action = None
+
+        step += 1
         if action is not None:
             registered_crafts += _newly_registered_craft_count(
                 universe, action, batch_index
             )
         universe.step(step, action)
-        frame = _render_frame(universe, batch_index)
+        if dream:
+            frame = _advance_dream(
+                policy, state, universe, action, batch_index, show_posterior
+            )
+        else:
+            frame = _render_frame(universe, batch_index)
         _draw_frame(screen, frame, cell_size)
         _draw_inventory(screen, universe, batch_index, registered_crafts)
         caption = f"aliencraft step {step} | {_describe_agent_position(universe)}"
+        if dream:
+            caption += " | dream"
+            if show_posterior:
+                caption += " | prior/posterior/true"
+        if manual_actions:
+            caption += f" | manual place={manual_state['selected_place_type']}"
         if action is not None:
             caption += f" | {_describe_action(universe, action)}"
         pygame.display.set_caption(caption)
         pygame.display.flip()
+        if policy is not None:
+            state["prev_action"] = (
+                action
+                if action is not None
+                else torch.zeros_like(state["prev_action"])
+            )
         clock.tick(fps)
 
     pygame.quit()
@@ -239,6 +420,81 @@ def _draw_agent_marker(universe, frame, batch_index):
             [255, 40, 220]
         )
     return frame
+
+
+def _manual_action_from_input(universe, events, manual_state):
+    for event in events:
+        if event.type != pygame.KEYDOWN:
+            continue
+        if event.key in (pygame.K_RIGHTBRACKET, pygame.K_EQUALS, pygame.K_PLUS):
+            manual_state["selected_place_type"] = (
+                manual_state["selected_place_type"] + 1
+            ) % universe.num_types
+            continue
+        if event.key in (pygame.K_LEFTBRACKET, pygame.K_MINUS):
+            manual_state["selected_place_type"] = (
+                manual_state["selected_place_type"] - 1
+            ) % universe.num_types
+            continue
+        if pygame.K_0 <= event.key <= pygame.K_9:
+            selected = event.key - pygame.K_0
+            if selected < universe.num_types:
+                manual_state["selected_place_type"] = selected
+            continue
+        if event.key in (pygame.K_PERIOD, pygame.K_RETURN, pygame.K_n):
+            return None
+        if event.key in (pygame.K_d, pygame.K_RIGHT):
+            return _manual_projected_action(universe, (0.0, 1.0))
+        if event.key in (pygame.K_a, pygame.K_LEFT):
+            return _manual_projected_action(universe, (0.0, -1.0))
+        if event.key in (pygame.K_s, pygame.K_DOWN):
+            return _manual_projected_action(universe, (1.0, 0.0))
+        if event.key in (pygame.K_w, pygame.K_UP):
+            return _manual_projected_action(universe, (-1.0, 0.0))
+        if event.key == pygame.K_c:
+            isqrt2 = 1.0 / math.sqrt(2.0)
+            return _manual_projected_action(universe, (isqrt2, isqrt2))
+        if event.key in (pygame.K_e, pygame.K_SPACE):
+            isqrt2 = 1.0 / math.sqrt(2.0)
+            return _manual_projected_action(universe, (isqrt2, -isqrt2))
+        if event.key == pygame.K_p:
+            isqrt2 = 1.0 / math.sqrt(2.0)
+            return _manual_projected_action(
+                universe,
+                (-isqrt2, isqrt2),
+                place_type=manual_state["selected_place_type"],
+            )
+
+    return _MANUAL_WAIT
+
+
+def _manual_projected_action(universe, projected_direction, place_type=None):
+    action = torch.zeros(
+        universe.batch_size,
+        2 + universe.num_types,
+        device=universe.device,
+        dtype=universe.actuators.dtype,
+    )
+    direction = torch.tensor(
+        projected_direction, device=universe.device, dtype=universe.actuators.dtype
+    ).expand(universe.batch_size, -1)
+    action[:, :2] = torch.linalg.solve(
+        universe.actuators, direction.unsqueeze(-1)
+    ).squeeze(-1)
+
+    if place_type is not None:
+        projected_place_type = torch.zeros(
+            universe.batch_size,
+            universe.num_types,
+            device=universe.device,
+            dtype=universe.place_type_actuator.dtype,
+        )
+        projected_place_type[:, place_type] = 1.0
+        action[:, 2:] = torch.linalg.solve(
+            universe.place_type_actuator, projected_place_type.unsqueeze(-1)
+        ).squeeze(-1)
+
+    return action
 
 
 def _newly_registered_craft_count(universe, action, batch_index):
@@ -324,35 +580,87 @@ def _parse_args():
         help="take random raw actions instead of actions from the checkpoint policy",
     )
     parser.add_argument(
+        "--manual",
+        action="store_true",
+        help="take actions from pygame keyboard input instead of the checkpoint policy",
+    )
+    parser.add_argument(
+        "--dream",
+        action="store_true",
+        help=(
+            "render decoded prior predictions from get_next_latent_prediction() "
+            "instead of real environment observations"
+        ),
+    )
+    parser.add_argument(
+        "--show-posterior",
+        action="store_true",
+        help="with --dream, show posterior decode beside the prior decode",
+    )
+    parser.add_argument(
         "--sprite-resolution",
         type=int,
         default=4,
-        help="pixels per universe cell in the generated material sprite texture",
+        help="pixels per universe cell for a fresh generated material sprite texture",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--env-state",
+        type=Path,
+        default=ENV_STATE_PATH,
+        help="environment state checkpoint to load",
+    )
+    parser.add_argument(
+        "--fresh-env",
+        action="store_true",
+        help="create a fresh environment instead of loading --env-state",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=1000,
+        help="number of animation steps to render",
+    )
+    parser.add_argument(
+        "--cell-size",
+        type=int,
+        default=8,
+        help="screen pixels per rendered observation pixel; does not change env size",
+    )
+    args = parser.parse_args()
+    if args.cell_size < 1:
+        parser.error("--cell-size must be at least 1")
+    if args.show_posterior and not args.dream:
+        parser.error("--show-posterior requires --dream")
+    return args
 
 
 if __name__ == "__main__":
     args = _parse_args()
     device = "cpu"
     with torch.inference_mode():
-        if args.random:
+        if (args.random or args.manual) and not args.dream:
             policy, state = None, None
             config = load_world_model_config(
                 str(ALIEN_DIR / "configs/world_model.json")
             ).model_config
         else:
             policy, config, state = _load_checkpoint_policy(device)
-        universe = _make_training_universe(
-            config,
-            device,
-            args.sprite_resolution,
-        )
+        if args.fresh_env:
+            universe = _make_training_universe(
+                config,
+                device,
+                args.sprite_resolution,
+            )
+        else:
+            universe = _make_env_state_universe(config, device, args.env_state)
         render_animation(
             universe,
-            steps=1000,
-            cell_size=4,
+            steps=args.steps,
+            cell_size=args.cell_size,
             policy=policy,
             state=state,
             random_actions=args.random,
+            manual_actions=args.manual,
+            dream=args.dream,
+            show_posterior=args.show_posterior,
         )
