@@ -177,13 +177,13 @@ class AlienCraftWorld(torch.nn.Module):
         assert (
             self.visual_field_size % self.sprite_resolution == 0
         ), "visual_field_size must be divisible by sprite_resolution"
+        
+        nb_start = -self.visual_field_size // 2 + self.sprite_resolution // 2
+        nb_end = nb_start + self.visual_field_size // self.sprite_resolution
+
         ii_nb, jj_nb = torch.meshgrid(
-            torch.arange(
-                self.visual_field_size // self.sprite_resolution, device=self.device
-            ),
-            torch.arange(
-                self.visual_field_size // self.sprite_resolution, device=self.device
-            ),
+            torch.arange(nb_start, nb_end, device=self.device),
+            torch.arange(nb_start, nb_end, device=self.device),
             indexing="ij",
         )
         nb_offsets = torch.stack(
