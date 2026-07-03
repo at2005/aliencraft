@@ -516,6 +516,8 @@ def _newly_registered_craft_count(universe, action, batch_index):
     crafted_type = crafted_type[batch_index].item()
     if crafted_type == -1:
         return 0
+    if not universe.craft_glow_gate(left_type, right_type)[batch_index].item():
+        return 0
     return int(not universe.tech_tree_progress[batch_index, crafted_type].item())
 
 

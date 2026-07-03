@@ -14,17 +14,22 @@ class AlienCraftWorld(torch.nn.Module):
         "positions",
         "grads",
         "distance_kernel",
+        "field_matter_affinity",
         "properties",
-        "fields_affected_by_types",
         "batch_idx",
         "agent_position",
         "agent_inventory",
         "sprite_positions",
-        "prop_matrix",
+        "prop_tensor",
         "tech_tree_progress",
         "nb_offsets",
         "sprites",
         "colour_palette",
+        "colour_projection",
+        "field_colour_directions",
+        "craft_map",
+        "pulse_omega",
+        "pulse_phase",
         "actuators",
         "place_type_actuator",
     )
@@ -71,17 +76,7 @@ class AlienCraftWorld(torch.nn.Module):
             batch_size, num_fields, width, height, device=self.device
         )
 
-        self.field_matter_affinity = torch.nn.Embedding(num_types, num_fields).to(
-            self.device
-        )
-        num_active_types = num_types - 1
-        assert num_active_types > 0, "num_active_types must be greater than 0"
-        active_type_ids = torch.randperm(num_types)[:num_active_types].to(self.device)
-        with torch.no_grad():
-            self.field_matter_affinity.weight.zero_()
-            self.field_matter_affinity.weight[active_type_ids] = torch.empty_like(
-                self.field_matter_affinity.weight[active_type_ids]
-            ).uniform_(-1.0, 1.0)
+        self.field_matter_affinity = self._init_field_matter_affinity(num_types - 1)
 
         self.num_common_types = num_common_types
         self.num_sparse_types = num_sparse_types
@@ -98,7 +93,9 @@ class AlienCraftWorld(torch.nn.Module):
         ).float()  # b, num_fields
 
         self.damping = 0.90
-        self.field_damping = 1.0
+        self.field_damping = 0.98  # < 1 so driven fields equilibrate
+        self.craft_energy_scale = 1.0  # higher = harder glow gate
+        self._init_pulse()
 
         ii, jj = torch.meshgrid(
             torch.arange(self.width, device=self.device),
@@ -119,6 +116,8 @@ class AlienCraftWorld(torch.nn.Module):
         distances = (positions[..., 0] - 3) ** 2 + (positions[..., 1] - 3) ** 2
         distances = distances.sqrt()
         inverse_distances = 1.0 / (distances + 1)
+        # normalised: spreads the source without changing total injection
+        inverse_distances = inverse_distances / inverse_distances.sum()
         self.distance_kernel = (
             inverse_distances.unsqueeze(0).unsqueeze(0).repeat(self.num_types, 1, 1, 1)
         )  # num_types, 1, 7, 7
@@ -133,11 +132,6 @@ class AlienCraftWorld(torch.nn.Module):
         )
 
         self.properties.uniform_(-1.0, 1.0)
-
-        # each type affects one field
-        self.fields_affected_by_types = torch.randint(
-            0, self.num_fields, (self.batch_size, self.num_types), device=self.device
-        )  # b, num_types
 
         self.mass_scale = 5.0
         self.batch_idx = torch.arange(self.batch_size, device=self.device)
@@ -160,14 +154,7 @@ class AlienCraftWorld(torch.nn.Module):
             0
         )  # b, sprite_resolution, sprite_resolution, 2
 
-        self.prop_matrix = torch.eye(
-            self.num_properties, device=self.device
-        ) + 1e-2 * torch.randn(
-            self.batch_size,
-            self.num_properties,
-            self.num_properties,
-            device=self.device,
-        )
+        self.prop_tensor = self._init_prop_tensor()
 
         # measures progress down the tech tree, true if the type has been discovered
         self.tech_tree_progress = torch.zeros(
@@ -194,6 +181,7 @@ class AlienCraftWorld(torch.nn.Module):
         self.init_sprites()
         self.create_colour_palette()
         self.create_actuators()
+        self.build_craft_map()
         self.seed_universe()
 
         self.initial_grid_copy = self.grid.detach().clone()
@@ -219,6 +207,42 @@ class AlienCraftWorld(torch.nn.Module):
             self.register_buffer(name, value, persistent=True)
 
         return self
+
+    def _init_pulse(self):
+        periods = 100.0 + 300.0 * torch.rand(
+            self.batch_size, self.num_fields, device=self.device
+        )
+        self.pulse_omega = 2 * math.pi / periods
+        self.pulse_phase = (
+            2 * math.pi * torch.rand(self.batch_size, self.num_fields, device=self.device)
+        )
+
+    def _init_prop_tensor(self):
+        # zero-mean bilinear chemistry, symmetric in the parents; gain 5 sits
+        # between chain collapse and binarisation (calibrated at P=3)
+        prop_tensor = torch.randn(
+            self.batch_size,
+            self.num_properties,
+            self.num_properties,
+            self.num_properties,
+            device=self.device,
+        )
+        prop_tensor = 0.5 * (prop_tensor + prop_tensor.transpose(-1, -2))
+        return 5.0 * prop_tensor / self.num_properties
+
+    def _init_field_matter_affinity(self, num_active_types: int):
+        # per-universe random subset of field-coupled types
+        assert num_active_types > 0, "num_active_types must be greater than 0"
+        active = torch.rand(self.batch_size, self.num_types, device=self.device).argsort(
+            dim=-1
+        )[:, :num_active_types]
+        mask = torch.zeros(
+            self.batch_size, self.num_types, dtype=torch.bool, device=self.device
+        ).scatter_(1, active, True)
+        values = torch.empty(
+            self.batch_size, self.num_types, self.num_fields, device=self.device
+        ).uniform_(-1.0, 1.0)
+        return values * mask.unsqueeze(-1)  # b, num_types, num_fields
 
     def create_actuators(self):
         if not self.actuator_random:
@@ -252,52 +276,29 @@ class AlienCraftWorld(torch.nn.Module):
         self.place_type_actuator.inverse()
 
     def create_colour_palette(self):
-        colour_palette = (
-            torch.arange(self.num_types, device=self.device) * 0.61803398875
-        ) % 1.0  # num_types
-        colour_palette = colour_palette.unsqueeze(0).expand(
-            self.batch_size, -1
-        )  # b, num_types
-        # permute the colour palette
-        perm = torch.randperm(self.num_types)
-        colour_palette = colour_palette[:, perm]  # b, num_types
-
-        colour_palette = colour_palette.unsqueeze(-1)  # b, num_types, 1
-        saturation_contrast = (
-            torch.tensor([0.48, 0.68], device=self.device)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .expand(self.batch_size, self.num_types, -1)
-        )  # b, num_types, 2
-
-        hsv = torch.cat(
-            [colour_palette, saturation_contrast], dim=-1
-        )  # b, num_types, 3
-        self.colour_palette = self.hsv_to_rgb(hsv)  # b, num_types, 3
-        self.colour_palette = (
-            (self.colour_palette * 255).floor().long()
-        )  # b, num_types, 3
-
-    def hsv_to_rgb(self, hsv: torch.Tensor):
-        h, s, v = hsv.unbind(-1)
-        i = torch.floor(h * 6).long()
-        f = h * 6 - i
-        p = v * (1 - s)
-        q = v * (1 - f * s)
-        t = v * (1 - (1 - f) * s)
-        choices = torch.stack(
-            [
-                torch.stack([v, t, p], dim=-1),
-                torch.stack([q, v, p], dim=-1),
-                torch.stack([p, v, t], dim=-1),
-                torch.stack([p, q, v], dim=-1),
-                torch.stack([t, p, v], dim=-1),
-                torch.stack([v, p, q], dim=-1),
-            ],
-            dim=-2,
+        # colour = orthonormal projection of properties; a rotation at P=3,
+        # so the full property state is readable from pixels
+        assert self.num_properties >= 3, "colour projection needs >= 3 properties"
+        proj = torch.randn(
+            self.batch_size, self.num_properties, 3, device=self.device
         )
-        idx = (i % 6).unsqueeze(-1).unsqueeze(-1).expand(*i.shape, 1, 3)
-        return choices.gather(-2, idx).squeeze(-2)
+        self.colour_projection = torch.linalg.qr(proj).Q
+        self.refresh_colour_palette()
+
+        # unit RGB shimmer direction per field
+        directions = torch.randn(
+            self.batch_size, self.num_fields, 3, device=self.device
+        )
+        self.field_colour_directions = directions / (
+            directions.norm(dim=-1, keepdim=True) + 1e-8
+        )
+
+    def refresh_colour_palette(self):
+        # unit tanh gain: invertible through 8-bit colour without blowup
+        rgb = 0.5 + 0.35 * torch.tanh(
+            self.properties @ self.colour_projection
+        )  # b, num_types, 3
+        self.colour_palette = (rgb * 255).floor().long()
 
     def init_sprites(self):
         perlin = self.perlin(
@@ -322,25 +323,59 @@ class AlienCraftWorld(torch.nn.Module):
 
         self.sprites = perlin
 
+    def build_craft_map(self):
+        # per-universe recipe DAG: type t = recent parent + partner, where the
+        # partner is a crafted intermediate 15% of the time, else a common
+        assert self.num_common_types >= 2, "need a non-empty common type as partner"
+        num_natural = self.num_common_types + self.num_sparse_types
+        self.craft_map = torch.full(
+            (self.batch_size, self.num_types, self.num_types),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        for t in range(num_natural, self.num_types):
+            taken = torch.ones(self.batch_size, dtype=torch.bool, device=self.device)
+            parent = torch.zeros_like(self.batch_idx)
+            partner = torch.zeros_like(self.batch_idx)
+            while taken.any():
+                new_parent = torch.randint(
+                    max(1, t - 10), t, (self.batch_size,), device=self.device
+                )
+                crafted = (
+                    torch.rand(self.batch_size, device=self.device) < 0.15
+                ) & (t > num_natural)
+                new_partner = torch.where(
+                    crafted,
+                    torch.randint(
+                        num_natural,
+                        max(num_natural + 1, t),
+                        (self.batch_size,),
+                        device=self.device,
+                    ),
+                    torch.randint(
+                        1, self.num_common_types, (self.batch_size,), device=self.device
+                    ),
+                )
+                parent = torch.where(taken, new_parent, parent)
+                partner = torch.where(taken, new_partner, partner)
+                taken = self.craft_map[self.batch_idx, parent, partner] != -1
+            self.craft_map[self.batch_idx, parent, partner] = t
+            self.craft_map[self.batch_idx, partner, parent] = t
+
     def craft(
         self,
         mat1_type: torch.Tensor,  # b,
         mat2_type: torch.Tensor,  # b,
     ):
-        # you craft with two types to get a new type
-        m = torch.max(mat1_type, mat2_type)
-        n = torch.min(mat1_type, mat2_type)
-        new_type = m * (m + 1) // 2 + n + 1 + self.num_common_types
+        # you craft with two types to get a new type (-1 if no recipe matches)
+        new_type = self.craft_map[self.batch_idx, mat1_type, mat2_type]
         mat1_props = self.properties[self.batch_idx, mat1_type]
         mat2_props = self.properties[self.batch_idx, mat2_type]
-        inherited_props: torch.Tensor = self.prop_matrix @ mat1_props.unsqueeze(
-            -1
-        ) + self.prop_matrix @ mat2_props.unsqueeze(-1)
-        inherited_props = inherited_props.squeeze(-1)
-        inherited_props = inherited_props / (
-            inherited_props.norm(dim=-1, keepdim=True) + 1e-8
+        inherited_props = torch.tanh(
+            torch.einsum("bijk,bj,bk->bi", self.prop_tensor, mat1_props, mat2_props)
         )
-        return torch.where(new_type < self.num_types, new_type, -1), inherited_props
+        return new_type, inherited_props
 
     def build_grads(self):
         return torch.tensor(
@@ -480,9 +515,20 @@ class AlienCraftWorld(torch.nn.Module):
         alive = grid > 0
 
         new_positions = new_positions.where(alive.unsqueeze(-1), self.positions)
+
+        # contested targets: nobody moves, so matter is conserved
+        b = self.batch_idx.unsqueeze(-1).unsqueeze(-1).expand_as(grid)
+        claims = torch.zeros_like(grid)
+        claims.index_put_(
+            (b[alive], new_positions[..., 0][alive], new_positions[..., 1][alive]),
+            torch.ones_like(grid[alive]),
+            accumulate=True,
+        )
+        contested = claims[b, new_positions[..., 0], new_positions[..., 1]] > 1
+        new_positions = new_positions.where(~contested.unsqueeze(-1), self.positions)
+
         # we only want to write cells into positions such that the positions in the original
         # grid were alive
-        b = self.batch_idx.unsqueeze(-1).unsqueeze(-1).expand_as(grid)
         new_grid[
             b[alive], new_positions[..., 0][alive], new_positions[..., 1][alive]
         ] = grid[alive]
@@ -491,9 +537,9 @@ class AlienCraftWorld(torch.nn.Module):
     def step_grid(self, step: int):
         # compute forces for each cell
         # field_matter_affinity is b, num_types, num_fields
-        affinity: torch.Tensor = self.field_matter_affinity(
-            self.grid
-        )  # b, h, w, num_fields
+        affinity: torch.Tensor = self.field_matter_affinity[
+            self.batch_idx.view(-1, 1, 1), self.grid
+        ]  # b, h, w, num_fields
         affinity = affinity.unsqueeze(-2)  # b, h, w, 1, num_fields
         field_force = -self.differential.grad(self.fields)  # b, 2, num_fields, h, w
         field_force = field_force.permute(0, 3, 4, 1, 2)  # b, h, w, 2, num_fields
@@ -504,7 +550,7 @@ class AlienCraftWorld(torch.nn.Module):
         )
         return self.move(self.grid, self.grid_velocity, step)
 
-    def step_fields(self):
+    def step_fields(self, step: int):
         # wave propagation for now
         delta_fields = self.field_vel.pow(2).unsqueeze(-1).unsqueeze(
             -1
@@ -535,21 +581,16 @@ class AlienCraftWorld(torch.nn.Module):
                 grid, self.distance_kernel, padding=3, groups=self.num_types
             )  # b, num_types, h, w
 
-        mass_equivalent = self.mass_scale * (
-            self.properties[..., 0].unsqueeze(-1).unsqueeze(-1)
-        )  # b, num_types, 1, 1
-
-        # this tells us the field values if we assume inverse 1/r distance from the type weighted by the mass equivalent of the type
-        mass_adjusted_field = grid * mass_equivalent  # b, num_types, h, w
-        delta_fields_matter = torch.zeros_like(self.fields)  # b, num_fields, h, w
-
-        field_idx = self.fields_affected_by_types.unsqueeze(-1).unsqueeze(-1)
-        field_idx = field_idx.expand(
-            -1, -1, self.fields.shape[-2], self.fields.shape[-1]
-        )
-        delta_fields_matter = delta_fields_matter.scatter_add(
-            dim=1, index=field_idx, src=mass_adjusted_field
-        )  # b, num_fields, h, w
+        # reciprocity: matter sources fields along the same affinity it feels
+        # them through, weighted by its mass and a per-universe pulse
+        pulse = 1.0 + torch.sin(self.pulse_omega * step + self.pulse_phase)
+        source = (
+            self.mass_scale
+            * self.properties[..., 0].unsqueeze(-1)
+            * self.field_matter_affinity
+            * pulse.unsqueeze(1)
+        )  # b, num_types, num_fields
+        delta_fields_matter = torch.einsum("btxy,btf->bfxy", grid, source)
 
         total_delta_fields = delta_fields + delta_fields_matter
         self.field_velocity = (
@@ -670,6 +711,7 @@ class AlienCraftWorld(torch.nn.Module):
             (self.agent_position[..., 0] + 1) % self.width,
             self.agent_position[..., 1],
         ]
+        craft_mask = craft_mask & self.craft_glow_gate(left_type, right_type)
         # ok so we replace the types at left and right with empty space
         # and add the new type to inventory
         new_grid = self.grid.clone()
@@ -709,6 +751,32 @@ class AlienCraftWorld(torch.nn.Module):
 
         self.grid = new_grid.where(new_grid != -1, self.grid)
 
+    def craft_glow_gate(self, left_type, right_type):
+        # fires iff |g(a)+g(b)| > E: local field must align with the pair's
+        # coupling strongly enough for its mass; g is the pre-tanh shimmer
+        field_here = self.fields[
+            self.batch_idx, :, self.agent_position[..., 0], self.agent_position[..., 1]
+        ]  # b, num_fields
+        pair_affinity = (
+            self.field_matter_affinity[self.batch_idx, left_type]
+            + self.field_matter_affinity[self.batch_idx, right_type]
+        )  # b, num_fields
+        glow = (pair_affinity * field_here).sum(-1).abs()
+        # E is relative to the ambient field level, so bite is invariant to
+        # field strength
+        field_rms = self.fields.pow(2).mean(dim=(1, 2, 3)).sqrt()
+        binding_energy = (
+            self.craft_energy_scale
+            * (
+                self.properties[self.batch_idx, left_type, 0]
+                + self.properties[self.batch_idx, right_type, 0]
+            ).abs()
+            * pair_affinity.norm(dim=-1)
+            * field_rms
+            / math.sqrt(self.num_fields)
+        )
+        return glow > binding_energy
+
     def render(self, agent_view=False):
         # render the universe with the sprites
         if agent_view:
@@ -723,8 +791,12 @@ class AlienCraftWorld(torch.nn.Module):
             grid = self.grid[
                 self.batch_idx.unsqueeze(-1).unsqueeze(-1), rows, cols
             ]  # (b, visual_field_size, visual_field_size)
+            fields_local = self.fields.permute(0, 2, 3, 1)[
+                self.batch_idx.unsqueeze(-1).unsqueeze(-1), rows, cols
+            ]  # (b, visual_field_size, visual_field_size, num_fields)
         else:
             grid = self.grid  # (b, h, w)
+            fields_local = self.fields.permute(0, 2, 3, 1)  # b, h, w, num_fields
 
         sprite_grid = self.sprites[
             self.batch_idx.unsqueeze(-1).unsqueeze(-1), grid
@@ -740,16 +812,27 @@ class AlienCraftWorld(torch.nn.Module):
             grid.shape[-1] * self.sprite_resolution,
         )  # b, h * sprite_resolution, w * sprite_resolution
 
-        return sprite_grid, grid
+        return sprite_grid, grid, fields_local
 
     def get_obs_for_agent(self, agent_view=False, normalise=False):
-        rendered_grid, grid = self.render(
+        self.refresh_colour_palette()
+        rendered_grid, grid, fields_local = self.render(
             agent_view
         )  # b, h * sprite_resolution, w * sprite_resolution
 
         rgb_grid = self.colour_palette[
             self.batch_idx.unsqueeze(-1).unsqueeze(-1), grid
-        ]  # b, h, w, 3
+        ].float()  # b, h, w, 3
+
+        # shimmer: field-coupling glow mapped to per-field RGB directions
+        affinity = self.field_matter_affinity[
+            self.batch_idx.view(-1, 1, 1), grid
+        ]  # b, h, w, num_fields
+        shimmer = torch.tanh(fields_local * affinity / 4.0)
+        shift = torch.einsum(
+            "bhwf,bfc->bhwc", shimmer, self.field_colour_directions
+        )  # b, h, w, 3
+        rgb_grid = rgb_grid + 40.0 * shift
 
         rgb_grid = rgb_grid.unsqueeze(2).unsqueeze(4)  # b, h, 1, w, 1, 3
         rgb_grid = rgb_grid.expand(
@@ -782,7 +865,7 @@ class AlienCraftWorld(torch.nn.Module):
     def step(self, step: int, action=None):
         if action is not None:
             self.apply_action(action)
-        self.fields = self.step_fields()
+        self.fields = self.step_fields(step)
         self.grid = self.step_grid(step)
 
     def reset_velocities(self):
@@ -813,34 +896,16 @@ class AlienCraftWorld(torch.nn.Module):
             self.tech_tree_progress = torch.zeros(
                 self.batch_size, self.num_types, device=self.device
             ).bool()
-            self.field_matter_affinity.weight.zero_()
             self.properties = torch.zeros(
                 self.batch_size, self.num_types, self.num_properties, device=self.device
             )
             self.properties.uniform_(-1.0, 1.0)
-            self.prop_matrix = torch.eye(
-                self.num_properties, device=self.device
-            ) + 1e-2 * torch.randn(
-                self.batch_size,
-                self.num_properties,
-                self.num_properties,
-                device=self.device,
-            )
+            self.prop_tensor = self._init_prop_tensor()
 
-            num_active_types = self.num_types // 2
-            assert num_active_types > 0, "num_active_types must be greater than 0"
-            active_type_ids = torch.randperm(self.num_types)[:num_active_types].to(
-                self.device
+            self.field_matter_affinity = self._init_field_matter_affinity(
+                self.num_types - 1
             )
-            self.field_matter_affinity.weight[active_type_ids] = torch.empty_like(
-                self.field_matter_affinity.weight[active_type_ids]
-            ).uniform_(-1.0, 1.0)
-            self.fields_affected_by_types = torch.randint(
-                0,
-                self.num_fields,
-                (self.batch_size, self.num_types),
-                device=self.device,
-            )  # b, num_types
+            self._init_pulse()
             self.agent_position = torch.randint(
                 0, self.width, (self.batch_size, 2), device=self.device
             ).long()
@@ -851,6 +916,7 @@ class AlienCraftWorld(torch.nn.Module):
             self.init_sprites()
             self.create_colour_palette()
             self.create_actuators()
+            self.build_craft_map()
             self.seed_universe()
 
 

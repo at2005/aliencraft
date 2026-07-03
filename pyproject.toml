@@ -14,6 +14,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gym = [
+    "gymnasium>=0.29",
+]
+baselines = [
+    "gymnasium>=0.29",
+    "stable-baselines3>=2.3",
+]
 render = [
     "matplotlib>=3.9.4",
     "numpy>=2.0.2",
@@ -22,6 +29,7 @@ render = [
 ]
 dev = [
     "black>=25.11.0",
+    "pytest>=8.0",
 ]
 
 [tool.setuptools.package-dir]
