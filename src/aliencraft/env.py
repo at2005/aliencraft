@@ -29,12 +29,14 @@ class AlienCraftEnv(gym.Env):
         device: str = "cpu",
         max_episode_steps: int = 1000,
         render_mode: str = None,
+        complexity_band: tuple = (0.1, 0.65),
         **world_kwargs,
     ):
         kwargs = {**DEFAULT_WORLD_KWARGS, **world_kwargs}
         self.world = AlienCraftWorld(batch_size=1, device=device, **kwargs)
         self.max_episode_steps = max_episode_steps
         self.render_mode = render_mode
+        self.complexity_band = complexity_band
 
         obs_size = self.world.visual_field_size
         self.observation_space = spaces.Box(
@@ -56,7 +58,14 @@ class AlienCraftEnv(gym.Env):
             # world generation draws from torch's global RNG
             torch.manual_seed(seed)
         with torch.no_grad():
-            self.world.reset()
+            # reject universes whose dynamics gzip as frozen or as noise
+            for _ in range(4):
+                self.world.reset()
+                if self.complexity_band is None:
+                    break
+                ratio = float(self.world.trajectory_complexity()[0])
+                if self.complexity_band[0] <= ratio <= self.complexity_band[1]:
+                    break
         self._t = 0
         return self._obs(), {"discovered_types": 0}
 

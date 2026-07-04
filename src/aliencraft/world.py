@@ -1,3 +1,4 @@
+import gzip
 import torch
 import torch.nn.functional as F
 from differential import Differential
@@ -31,7 +32,6 @@ class AlienCraftWorld(torch.nn.Module):
         "pulse_omega",
         "pulse_phase",
         "actuators",
-        "place_type_actuator",
     )
 
     def __init__(
@@ -48,7 +48,6 @@ class AlienCraftWorld(torch.nn.Module):
         visual_field_size: int,
         device: str,
         driven_fields: bool = False,
-        actuator_random: bool = False,
     ):
         super().__init__()
         # each cell has a type
@@ -63,7 +62,6 @@ class AlienCraftWorld(torch.nn.Module):
         self.batch_size = batch_size
         self.visual_field_size = visual_field_size
         self.driven_fields = driven_fields
-        self.actuator_random = actuator_random
         self.grid = torch.zeros(batch_size, width, height, device=self.device)
         self.grid_velocity = torch.zeros(
             batch_size, width, height, 2, device=self.device
@@ -245,35 +243,14 @@ class AlienCraftWorld(torch.nn.Module):
         return values * mask.unsqueeze(-1)  # b, num_types, num_fields
 
     def create_actuators(self):
-        if not self.actuator_random:
-            self.actuators = (
-                torch.eye(2, device=self.device)
-                .unsqueeze(0)
-                .expand(self.batch_size, -1, -1)
-            )
-            self.place_type_actuator = (
-                torch.eye(self.num_types, device=self.device)
-                .unsqueeze(0)
-                .expand(self.batch_size, -1, -1)
-            )
-            return
-
         self.actuators = torch.randn(self.batch_size, 2, 2, device=self.device)
-        self.place_type_actuator = torch.randn(
-            self.batch_size, self.num_types, self.num_types, device=self.device
-        )
         # make positive semidefinite
         self.actuators = self.actuators @ self.actuators.transpose(
             1, 2
         ) + 1e-4 * torch.eye(2, device=self.device)
-        self.place_type_actuator = (
-            self.place_type_actuator @ self.place_type_actuator.transpose(1, 2)
-            + 1e-4 * torch.eye(self.num_types, device=self.device)
-        )
 
         # test for invertibility, will throw runtime error if not invertible
         self.actuators.inverse()
-        self.place_type_actuator.inverse()
 
     def create_colour_palette(self):
         # colour = orthonormal projection of properties; a rotation at P=3,
@@ -614,11 +591,7 @@ class AlienCraftWorld(torch.nn.Module):
         direction = direction.squeeze(-1)  # b, 2
         direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
 
-        actuated_place_type = self.place_type_actuator @ place_type.unsqueeze(
-            -1
-        )  # b, num_types
-        actuated_place_type = actuated_place_type.squeeze(-1)
-        argmaxxed_place_type = actuated_place_type.argmax(dim=-1)
+        argmaxxed_place_type = place_type.argmax(dim=-1)
 
         isqrt2 = 1.0 / math.sqrt(2)
         directions_to_project = torch.tensor(
@@ -861,6 +834,34 @@ class AlienCraftWorld(torch.nn.Module):
             final_colour = final_colour / 255.0
 
         return final_colour
+
+    def trajectory_complexity(self, spin: int = 100, steps: int = 200, every: int = 4):
+        # gzip ratio of the state trajectory per universe: ~0.02 = frozen,
+        # ~0.8 = noise, healthy worlds measure 0.29-0.47
+        frames = []
+        with torch.no_grad():
+            for t in range(spin):
+                self.step(t)
+            for t in range(steps):
+                self.step(spin + t)
+                if t % every == 0:
+                    state = torch.cat(
+                        [
+                            self.grid.to(torch.uint8).unsqueeze(1),
+                            (self.fields * 8)
+                            .clamp(-127, 127)
+                            .to(torch.int8)
+                            .view(torch.uint8),
+                        ],
+                        dim=1,
+                    )
+                    frames.append(state.cpu())
+        frames = torch.stack(frames)
+        ratios = []
+        for b in range(self.batch_size):
+            raw = frames[:, b].numpy().tobytes()
+            ratios.append(len(gzip.compress(raw)) / len(raw))
+        return torch.tensor(ratios)
 
     def step(self, step: int, action=None):
         if action is not None:

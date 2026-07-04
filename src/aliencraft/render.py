@@ -483,16 +483,7 @@ def _manual_projected_action(universe, projected_direction, place_type=None):
     ).squeeze(-1)
 
     if place_type is not None:
-        projected_place_type = torch.zeros(
-            universe.batch_size,
-            universe.num_types,
-            device=universe.device,
-            dtype=universe.place_type_actuator.dtype,
-        )
-        projected_place_type[:, place_type] = 1.0
-        action[:, 2:] = torch.linalg.solve(
-            universe.place_type_actuator, projected_place_type.unsqueeze(-1)
-        ).squeeze(-1)
+        action[:, 2 + place_type] = 1.0
 
     return action
 
