@@ -53,6 +53,7 @@ pygame.key.set_repeat(180, 70)
 selected = 0
 flash, flash_t = "", 0
 step = 0
+SHIMMER_BOOST = 3.0  # display-only exaggeration of the field tint
 running = True
 with torch.no_grad():
     while running:
@@ -107,7 +108,9 @@ with torch.no_grad():
             world.step(step, action_for(OCTANT["noop"]))
             step += 1
 
+        world.field_colour_directions *= SHIMMER_BOOST
         frame = world.get_obs_for_agent(agent_view=False)[0]
+        world.field_colour_directions /= SHIMMER_BOOST
         img = frame.clamp(0, 255).byte().numpy()
         surf = pygame.transform.scale(
             pygame.surfarray.make_surface(img), (world_px, world_px)
@@ -115,12 +118,24 @@ with torch.no_grad():
         screen.fill((12, 12, 16))
         screen.blit(surf, (0, 0))
 
-        # agent marker
+        # agent marker, with a pulsing ring when a craft is ready here
         ax, ay = world.agent_position[0].tolist()
         cell = world.sprite_resolution * SCALE
         pygame.draw.rect(
             screen, (255, 255, 255), (ax * cell, ay * cell, cell, cell), 2
         )
+        l, r = neighbours()
+        ready = (
+            l and r
+            and int(world.craft_map[0, l, r]) != -1
+            and bool(world.craft_glow_gate(torch.tensor([l]), torch.tensor([r]))[0])
+        )
+        if ready:
+            radius = int(cell * (1.2 + 0.35 * math.sin(step * 0.25)))
+            pygame.draw.circle(
+                screen, (255, 210, 60),
+                (ax * cell + cell // 2, ay * cell + cell // 2), radius, 3,
+            )
 
         # sidebar: discoveries, craft readout, inventory
         ui = [f"discovered: {int(world.tech_tree_progress[0].sum())}/95"]
