@@ -1,11 +1,15 @@
-A meta-learning environment/benchmark based on the game of Minecraft/Crafter.
+We introduce AlienCraft, a procedural world generator that samples a new latent physics and chemistry for every world. The setup is simple:
 
-Instead of fixed materials, we initialise an abstract type system that populates procedurally generated 2D grid-worlds. Some of these types have affinities to "fields" that affect their movement and interactions. In turn, types can generate fields. Fields are continuous scalar fields, while types live on a discrete grid.
+- 2D Grid Worlds
+- An abstract type system over materials: each "type" occupies a cell in the grid world. A type has a 3-dimensional property vector that maps to its base colour. Types can be crafted using tech-tree rules the agent must discover. Types are distributed in space using Perlin noise.
+- Each world has N scalar fields partially observable to the agent:
+  - Materials couple to fields via an affinity vector. The coupling is symmetric in that matter sources fields and fields influence matter.
+  - Local field values tint the types' colour, which is what makes fields partially observable
+  - To prevent the fields from exploding, we add a field damping factor
+  - To prevent the fields from freezing into static states, we add a sinusoidal term that oscillates how matter influences field values.
+- A craft is a commuting operation between two types. Type A + Type B → Type C, where C has properties inherited from A and B using the equation: P_c = tanh(T(p_a, p_b)) where T is a bilinear map sampled per-universe. The child's field affinities are similarly inherited.
+  - Crafts succeed if the local affinity-weighted field magnitude exceeds the activation energy, given by the absolute sum of the two masses relative to the ambient field level.
 
-Types can be combined to create new types with different properties/affinities through a crafting system. The agent is given a "craft" action that allows it to combine two types beside it into a new type.
+We reward the agent for finding new types, similar to Crafter. The goal is to incentivise the agent to ascend its tech tree.
 
-Unlike Crafter, however, the agent does not have any survival constraint. It is effectively unbounded and progress is measured by how far down the tech tree it can get.
-
-The meta-learning task is to understand the tech tree of a novel world and progress down it. We can increase the difficulty of the meta-learning task by increasing the degrees of freedom in the universe ruleset generator.
-
-While this is less ideal than a "true" alien universe, it gives us structure and meaningful worlds, versus pure chaos/randomness that plagued the Lagrangian/CA setups.
+During generation we filter out "too boring" and "too chaotic" universes by rolling out universe dynamics and passing them through a gzip filter band.
