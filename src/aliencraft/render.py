@@ -503,7 +503,7 @@ def _newly_registered_craft_count(universe, action, batch_index):
         (pos[..., 0] + 1) % universe.width,
         pos[..., 1],
     ]
-    crafted_type, _ = universe.craft(left_type, right_type)
+    crafted_type, _, _ = universe.craft(left_type, right_type)
     crafted_type = crafted_type[batch_index].item()
     if crafted_type == -1:
         return 0

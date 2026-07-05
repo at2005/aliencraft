@@ -22,6 +22,7 @@ class AlienCraftWorld(torch.nn.Module):
         "agent_inventory",
         "sprite_positions",
         "prop_tensor",
+        "sens_tensor",
         "tech_tree_progress",
         "nb_offsets",
         "sprites",
@@ -74,7 +75,7 @@ class AlienCraftWorld(torch.nn.Module):
             batch_size, num_fields, width, height, device=self.device
         )
 
-        self.field_matter_affinity = self._init_field_matter_affinity(num_types - 1)
+        self.field_matter_affinity = self._init_field_matter_affinity(num_types)
 
         self.num_common_types = num_common_types
         self.num_sparse_types = num_sparse_types
@@ -152,7 +153,8 @@ class AlienCraftWorld(torch.nn.Module):
             0
         )  # b, sprite_resolution, sprite_resolution, 2
 
-        self.prop_tensor = self._init_prop_tensor()
+        self.prop_tensor = self._init_mix_tensor(self.num_properties)
+        self.sens_tensor = self._init_mix_tensor(self.num_fields)
 
         # measures progress down the tech tree, true if the type has been discovered
         self.tech_tree_progress = torch.zeros(
@@ -215,18 +217,12 @@ class AlienCraftWorld(torch.nn.Module):
             2 * math.pi * torch.rand(self.batch_size, self.num_fields, device=self.device)
         )
 
-    def _init_prop_tensor(self):
-        # zero-mean bilinear chemistry, symmetric in the parents; gain 5 sits
-        # between chain collapse and binarisation (calibrated at P=3)
-        prop_tensor = torch.randn(
-            self.batch_size,
-            self.num_properties,
-            self.num_properties,
-            self.num_properties,
-            device=self.device,
-        )
-        prop_tensor = 0.5 * (prop_tensor + prop_tensor.transpose(-1, -2))
-        return 5.0 * prop_tensor / self.num_properties
+    def _init_mix_tensor(self, dim: int):
+        # zero-mean bilinear mixing, symmetric in the parents; gain 5 sits
+        # between chain collapse and binarisation (calibrated at dim 3)
+        tensor = torch.randn(self.batch_size, dim, dim, dim, device=self.device)
+        tensor = 0.5 * (tensor + tensor.transpose(-1, -2))
+        return 5.0 * tensor / dim
 
     def _init_field_matter_affinity(self, num_active_types: int):
         # per-universe random subset of field-coupled types
@@ -352,7 +348,12 @@ class AlienCraftWorld(torch.nn.Module):
         inherited_props = torch.tanh(
             torch.einsum("bijk,bj,bk->bi", self.prop_tensor, mat1_props, mat2_props)
         )
-        return new_type, inherited_props
+        mat1_sens = self.field_matter_affinity[self.batch_idx, mat1_type]
+        mat2_sens = self.field_matter_affinity[self.batch_idx, mat2_type]
+        inherited_sens = torch.tanh(
+            torch.einsum("bijk,bj,bk->bi", self.sens_tensor, mat1_sens, mat2_sens)
+        )
+        return new_type, inherited_props, inherited_sens
 
     def build_grads(self):
         return torch.tensor(
@@ -688,7 +689,9 @@ class AlienCraftWorld(torch.nn.Module):
         # ok so we replace the types at left and right with empty space
         # and add the new type to inventory
         new_grid = self.grid.clone()
-        crafted_type, crafted_type_properties = self.craft(left_type, right_type)
+        crafted_type, crafted_type_properties, crafted_type_sens = self.craft(
+            left_type, right_type
+        )
 
         new_grid[
             self.batch_idx,
@@ -709,6 +712,11 @@ class AlienCraftWorld(torch.nn.Module):
             cond.unsqueeze(-1),
             crafted_type_properties,
             self.properties[self.batch_idx, crafted_type],
+        )
+        self.field_matter_affinity[self.batch_idx, crafted_type] = torch.where(
+            cond.unsqueeze(-1),
+            crafted_type_sens,
+            self.field_matter_affinity[self.batch_idx, crafted_type],
         )
         self.tech_tree_progress[self.batch_idx, crafted_type] = (
             cond | self.tech_tree_progress[self.batch_idx, crafted_type]
@@ -901,10 +909,11 @@ class AlienCraftWorld(torch.nn.Module):
                 self.batch_size, self.num_types, self.num_properties, device=self.device
             )
             self.properties.uniform_(-1.0, 1.0)
-            self.prop_tensor = self._init_prop_tensor()
+            self.prop_tensor = self._init_mix_tensor(self.num_properties)
+            self.sens_tensor = self._init_mix_tensor(self.num_fields)
 
             self.field_matter_affinity = self._init_field_matter_affinity(
-                self.num_types - 1
+                self.num_types
             )
             self._init_pulse()
             self.agent_position = torch.randint(
