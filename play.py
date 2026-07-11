@@ -102,8 +102,8 @@ with torch.no_grad():
         if pending is not None:
             world.step(step, pending)
             step += 1
-        # time-warp: pulse periods are 100-400 steps, so run extra noop steps
-        # per frame to make the shimmer visibly breathe at human timescales
+        # time-warp: run extra noop steps per frame so slow universes
+        # visibly breathe at human timescales
         for _ in range(3):
             world.step(step, action_for(OCTANT["noop"]))
             step += 1

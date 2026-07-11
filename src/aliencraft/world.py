@@ -1,4 +1,3 @@
-import gzip
 import torch
 import torch.nn.functional as F
 from differential import Differential
@@ -10,8 +9,6 @@ class AlienCraftWorld(torch.nn.Module):
         "grid",
         "grid_velocity",
         "fields",
-        "field_velocity",
-        "field_vel",
         "positions",
         "grads",
         "distance_kernel",
@@ -30,8 +27,16 @@ class AlienCraftWorld(torch.nn.Module):
         "colour_projection",
         "field_colour_directions",
         "craft_map",
-        "pulse_omega",
-        "pulse_phase",
+        "nca_w1",
+        "nca_w2",
+        "nca_b1",
+        "nca_b2",
+        "nca_alpha",
+        "nca_state",
+        "field_act1",
+        "field_act2",
+        "chem_act",
+        "sens_act",
         "actuators",
     )
 
@@ -71,9 +76,6 @@ class AlienCraftWorld(torch.nn.Module):
         self.fields = torch.zeros(
             batch_size, num_fields, width, height, device=self.device
         )
-        self.field_velocity = torch.zeros(
-            batch_size, num_fields, width, height, device=self.device
-        )
 
         self.field_matter_affinity = self._init_field_matter_affinity(num_types)
 
@@ -87,14 +89,8 @@ class AlienCraftWorld(torch.nn.Module):
         self.differential = Differential(num_fields).to(self.device)
 
         self.dt = 0.1
-        self.field_vel = torch.randint(
-            1, 3, (self.batch_size, self.num_fields), device=self.device
-        ).float()  # b, num_fields
-
         self.damping = 0.90
-        self.field_damping = 0.98  # < 1 so driven fields equilibrate
         self.craft_energy_scale = 1.0  # higher = harder glow gate
-        self._init_pulse()
 
         ii, jj = torch.meshgrid(
             torch.arange(self.width, device=self.device),
@@ -106,26 +102,7 @@ class AlienCraftWorld(torch.nn.Module):
 
         self.grads = self.build_grads()
 
-        ii, jj = torch.meshgrid(
-            torch.arange(7, device=self.device),
-            torch.arange(7, device=self.device),
-            indexing="ij",
-        )
-        positions = torch.stack([ii, jj], dim=-1)  # 7, 7, 2
-        distances = (positions[..., 0] - 3) ** 2 + (positions[..., 1] - 3) ** 2
-        distances = distances.sqrt()
-        inverse_distances = 1.0 / (distances + 1)
-        # normalised: spreads the source without changing total injection
-        inverse_distances = inverse_distances / inverse_distances.sum()
-        self.distance_kernel = (
-            inverse_distances.unsqueeze(0).unsqueeze(0).repeat(self.num_types, 1, 1, 1)
-        )  # num_types, 1, 7, 7
-        assert self.distance_kernel.shape == (
-            self.num_types,
-            1,
-            7,
-            7,
-        ), "distance_kernel is not the correct shape"
+        self._init_distance_kernel()
         self.properties = torch.zeros(
             self.batch_size, self.num_types, self.num_properties, device=self.device
         )
@@ -155,6 +132,7 @@ class AlienCraftWorld(torch.nn.Module):
 
         self.prop_tensor = self._init_mix_tensor(self.num_properties)
         self.sens_tensor = self._init_mix_tensor(self.num_fields)
+        self._init_nca()
 
         # measures progress down the tech tree, true if the type has been discovered
         self.tech_tree_progress = torch.zeros(
@@ -208,14 +186,61 @@ class AlienCraftWorld(torch.nn.Module):
 
         return self
 
-    def _init_pulse(self):
-        periods = 100.0 + 300.0 * torch.rand(
-            self.batch_size, self.num_fields, device=self.device
+    def _sample_series(self, k=4):
+        # bounded sampled nonlinearity: sum_k a_k sin(w_k x + p_k), sum|a| = 1
+        a = torch.randn(self.batch_size, k, device=self.device)
+        a = a / a.abs().sum(1, keepdim=True).clamp_min(1e-6)
+        w = torch.exp(
+            torch.empty(self.batch_size, k, device=self.device).uniform_(
+                math.log(0.5), math.log(4.0)
+            )
         )
-        self.pulse_omega = 2 * math.pi / periods
-        self.pulse_phase = (
-            2 * math.pi * torch.rand(self.batch_size, self.num_fields, device=self.device)
+        p = torch.rand(self.batch_size, k, device=self.device) * 2 * math.pi
+        return torch.stack([a, w, p], dim=1)
+
+    def _series(self, x, act):
+        a, w, p = act[:, 0], act[:, 1], act[:, 2]
+        shape = [x.shape[0]] + [1] * (x.dim() - 1) + [act.shape[-1]]
+        y = torch.sin(w.view(shape) * x.unsqueeze(-1) + p.view(shape))
+        return (y * a.view(shape)).sum(-1)
+
+    def _init_nca(self):
+        # per-universe random propagation law over visible + hidden channels
+        b, f = self.batch_size, self.num_fields
+        c = f + 5
+        m, cin = 16, c + f
+        gain = torch.exp(
+            torch.empty(b, 1, 1, 1, 1, device=self.device).uniform_(
+                math.log(0.25), math.log(8.0)
+            )
         )
+        self.nca_w1 = torch.randn(b, m, cin, 3, 3, device=self.device) * gain / (cin * 9) ** 0.5
+        self.nca_w2 = torch.randn(b, c, m, 3, 3, device=self.device) * gain / (m * 9) ** 0.5
+        self.nca_b1 = torch.randn(b, m, device=self.device) * 0.5
+        self.nca_b2 = torch.randn(b, c, device=self.device) * 0.5
+        self.nca_alpha = torch.exp(
+            torch.empty(b, 1, 1, 1, device=self.device).uniform_(math.log(0.05), 0.0)
+        )
+        self.field_act1 = self._sample_series()
+        self.field_act2 = self._sample_series()
+        self.chem_act = self._sample_series()
+        self.sens_act = self._sample_series()
+        self.nca_state = torch.zeros(b, c, self.width, self.height, device=self.device)
+
+    def _init_distance_kernel(self):
+        # sampled radial emission profile k(r), L1-normalised
+        ii, jj = torch.meshgrid(
+            torch.arange(7, device=self.device),
+            torch.arange(7, device=self.device),
+            indexing="ij",
+        )
+        r = ((ii - 3) ** 2 + (jj - 3) ** 2).float().sqrt()
+        r = r / r.max()
+        powers = torch.stack([r**n for n in range(5)])
+        kernel = torch.einsum(
+            "bn,nxy->bxy", torch.randn(self.batch_size, 5, device=self.device), powers
+        )
+        self.distance_kernel = kernel / kernel.abs().sum((1, 2), keepdim=True).clamp_min(1e-6)
 
     def _init_mix_tensor(self, dim: int):
         # zero-mean bilinear mixing, symmetric in the parents; gain 5 sits
@@ -345,13 +370,15 @@ class AlienCraftWorld(torch.nn.Module):
         new_type = self.craft_map[self.batch_idx, mat1_type, mat2_type]
         mat1_props = self.properties[self.batch_idx, mat1_type]
         mat2_props = self.properties[self.batch_idx, mat2_type]
-        inherited_props = torch.tanh(
-            torch.einsum("bijk,bj,bk->bi", self.prop_tensor, mat1_props, mat2_props)
+        inherited_props = self._series(
+            torch.einsum("bijk,bj,bk->bi", self.prop_tensor, mat1_props, mat2_props),
+            self.chem_act,
         )
         mat1_sens = self.field_matter_affinity[self.batch_idx, mat1_type]
         mat2_sens = self.field_matter_affinity[self.batch_idx, mat2_type]
-        inherited_sens = torch.tanh(
-            torch.einsum("bijk,bj,bk->bi", self.sens_tensor, mat1_sens, mat2_sens)
+        inherited_sens = self._series(
+            torch.einsum("bijk,bj,bk->bi", self.sens_tensor, mat1_sens, mat2_sens),
+            self.sens_act,
         )
         return new_type, inherited_props, inherited_sens
 
@@ -528,53 +555,45 @@ class AlienCraftWorld(torch.nn.Module):
         )
         return self.move(self.grid, self.grid_velocity, step)
 
+    def _nca_conv(self, x, w, bias):
+        b = x.shape[0]
+        out = F.conv2d(
+            x.reshape(1, -1, *x.shape[2:]),
+            w.reshape(-1, w.shape[2], 3, 3),
+            padding=1,
+            groups=b,
+        ).reshape(b, -1, *x.shape[2:])
+        return out + bias.view(b, -1, 1, 1)
+
     def step_fields(self, step: int):
-        # wave propagation for now
-        delta_fields = self.field_vel.pow(2).unsqueeze(-1).unsqueeze(
-            -1
-        ) * self.differential.laplacian(
-            self.fields
-        )  # b, num_fields, h, w
-        # compute distance r from source types and populate fields
-        # we compute distance from each source type to everywhere else in the grid
-        # then the field value is the sum of the fields from all source types at that distance
-        # we look at each cell value and see if there are any source types up to radius r from that cell
-        # then the force is equal to 1/r since it's 2d
-        grid_types = self.grid.unsqueeze(-1)  # b, h, w, 1
-        types = (
-            torch.arange(self.num_types, device=self.device)
-            .unsqueeze(0)
-            .unsqueeze(0)
-            .unsqueeze(0)
-        )  # 1, 1, num_types
-        grid_types_masked = grid_types == types
-        grid = grid_types_masked.squeeze(1).float()  # b, h, w, num_types
-        grid = grid.permute(0, 3, 1, 2)  # b, num_types, h, w
-
-        # so we have a deconstructed map of types in each cell
-        # we now compute a convolution of each type with a kernel that captures the distance from each type
-
-        if self.driven_fields:
-            grid = F.conv2d(
-                grid, self.distance_kernel, padding=3, groups=self.num_types
-            )  # b, num_types, h, w
-
         # reciprocity: matter sources fields along the same affinity it feels
-        # them through, weighted by its mass and a per-universe pulse
-        pulse = 1.0 + torch.sin(self.pulse_omega * step + self.pulse_phase)
+        # them through; the sampled NCA is the propagation law
+        grid = (
+            (self.grid.unsqueeze(-1) == torch.arange(self.num_types, device=self.device))
+            .float()
+            .permute(0, 3, 1, 2)
+        )  # b, num_types, h, w
+        if self.driven_fields:
+            b, t, h, w = grid.shape
+            kernel = self.distance_kernel.view(b, 1, 1, 7, 7).expand(b, t, 1, 7, 7)
+            grid = F.conv2d(
+                grid.reshape(1, b * t, h, w),
+                kernel.reshape(b * t, 1, 7, 7),
+                padding=3,
+                groups=b * t,
+            ).reshape(b, t, h, w)
         source = (
             self.mass_scale
             * self.properties[..., 0].unsqueeze(-1)
             * self.field_matter_affinity
-            * pulse.unsqueeze(1)
         )  # b, num_types, num_fields
-        delta_fields_matter = torch.einsum("btxy,btf->bfxy", grid, source)
-
-        total_delta_fields = delta_fields + delta_fields_matter
-        self.field_velocity = (
-            self.damping * self.field_velocity + total_delta_fields * self.dt
-        )
-        return self.field_damping * self.fields + self.field_velocity * self.dt
+        src = torch.einsum("btxy,btf->bfxy", grid, source)
+        src = src / src.flatten(1).std(dim=1).clamp_min(1e-6).view(-1, 1, 1, 1)
+        x = torch.cat([self.nca_state, src], dim=1)
+        h = self._series(self._nca_conv(x, self.nca_w1, self.nca_b1), self.field_act1)
+        new = self._series(self._nca_conv(h, self.nca_w2, self.nca_b2), self.field_act2)
+        self.nca_state = (1 - self.nca_alpha) * self.nca_state + self.nca_alpha * new
+        return self.nca_state[:, : self.num_fields].clone()
 
     def actuator_project(self, action: torch.Tensor):
         # action is b, action_dim
@@ -843,34 +862,6 @@ class AlienCraftWorld(torch.nn.Module):
 
         return final_colour
 
-    def trajectory_complexity(self, spin: int = 100, steps: int = 200, every: int = 4):
-        # gzip ratio of the state trajectory per universe: ~0.02 = frozen,
-        # ~0.8 = noise, healthy worlds measure 0.29-0.47
-        frames = []
-        with torch.no_grad():
-            for t in range(spin):
-                self.step(t)
-            for t in range(steps):
-                self.step(spin + t)
-                if t % every == 0:
-                    state = torch.cat(
-                        [
-                            self.grid.to(torch.uint8).unsqueeze(1),
-                            (self.fields * 8)
-                            .clamp(-127, 127)
-                            .to(torch.int8)
-                            .view(torch.uint8),
-                        ],
-                        dim=1,
-                    )
-                    frames.append(state.cpu())
-        frames = torch.stack(frames)
-        ratios = []
-        for b in range(self.batch_size):
-            raw = frames[:, b].numpy().tobytes()
-            ratios.append(len(gzip.compress(raw)) / len(raw))
-        return torch.tensor(ratios)
-
     def step(self, step: int, action=None):
         if action is not None:
             self.apply_action(action)
@@ -880,13 +871,6 @@ class AlienCraftWorld(torch.nn.Module):
     def reset_velocities(self):
         self.grid_velocity = torch.zeros(
             self.batch_size, self.width, self.height, 2, device=self.device
-        )
-        self.field_velocity = torch.zeros(
-            self.batch_size,
-            self.num_fields,
-            self.width,
-            self.height,
-            device=self.device,
         )
 
     def reset(self):
@@ -915,7 +899,8 @@ class AlienCraftWorld(torch.nn.Module):
             self.field_matter_affinity = self._init_field_matter_affinity(
                 self.num_types
             )
-            self._init_pulse()
+            self._init_nca()
+            self._init_distance_kernel()
             self.agent_position = torch.randint(
                 0, self.width, (self.batch_size, 2), device=self.device
             ).long()
