@@ -239,7 +239,8 @@ def edge_stats(world, spin: int = 100, steps: int = 200, every: int = 4):
         [
             len(gzip.compress(frames[:, b].numpy().tobytes())) / frames[:, b].numel()
             for b in range(world.batch_size)
-        ]
+        ],
+        device=world.device,
     )
     return dict(
         complexity=complexity,
