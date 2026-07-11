@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from gymnasium import spaces
 
-from .filter import accept, edge_stats
+from .filter import sample_edge_world
 from .world import AlienCraftWorld
 
 # naturals are 5% of the tech tree; the rest is a per-universe recipe DAG
@@ -60,12 +60,10 @@ class AlienCraftEnv(gym.Env):
             torch.manual_seed(seed)
         with torch.no_grad():
             # reject universes that are frozen, noise, source-blind, or muddy
-            for _ in range(24):
+            if self.complexity_band is None:
                 self.world.reset()
-                if self.complexity_band is None:
-                    break
-                if accept(edge_stats(self.world), self.complexity_band)[0]:
-                    break
+            else:
+                sample_edge_world(self.world, self.complexity_band)
         self._t = 0
         return self._obs(), {"discovered_types": 0}
 

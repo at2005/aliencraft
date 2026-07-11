@@ -8,7 +8,7 @@ import pygame
 import torch
 
 from aliencraft import AlienCraftWorld
-from aliencraft.filter import accept, edge_stats
+from aliencraft.filter import sample_edge_world
 
 SCALE = 3
 SIDEBAR = 220
@@ -29,15 +29,11 @@ world = AlienCraftWorld(
 
 
 def new_universe():
-    for i in range(24):
-        world.reset()
-        if bool(accept(edge_stats(world))[0]):
-            return
-        print(f"rejected universe {i + 1}, resampling")
+    print("sampling universe...", flush=True)
+    print(f"accepted after {sample_edge_world(world, tries=999)} tries")
 
 
-with torch.no_grad():
-    new_universe()
+new_universe()
 
 
 def action_for(direction, place_type=None):

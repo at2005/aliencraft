@@ -6,6 +6,15 @@ import torch
 import torch.nn.functional as F
 
 
+def sample_edge_world(world, band=(0.1, 0.65), tries=96):
+    with torch.no_grad():
+        for i in range(tries):
+            world.reset()
+            if bool(accept(edge_stats(world), band)[0]):
+                return i + 1
+    raise RuntimeError(f"no edge universe found in {tries} samples")
+
+
 def accept(stats, band=(0.1, 0.65)):
     return (
         (stats["complexity"] >= band[0]) & (stats["complexity"] <= band[1])
