@@ -6,12 +6,25 @@ import torch
 import torch.nn.functional as F
 
 
-def sample_edge_world(world, band=(0.1, 0.65), tries=96):
+def sample_edge_world(world, band=(0.1, 0.65), tries=96, gate_tries=60):
+    # dynamics filters don't depend on the gate genome, so the gate is
+    # resampled blockwise on worlds whose dynamics already passed
     with torch.no_grad():
         for i in range(tries):
             world.reset()
-            if bool(accept(edge_stats(world), band)[0]):
-                return i + 1
+            stats = edge_stats(world)
+            stats_sans_gate = dict(
+                stats,
+                climbable=torch.ones_like(stats["climbable"]),
+                bite=torch.zeros_like(stats["bite"]),
+            )
+            if not bool(accept(stats_sans_gate, band)[0]):
+                continue
+            for _ in range(gate_tries):
+                fr = rungs_open(world)
+                if bool((fr > 0).all(1)[0]) and float(fr.median(1).values[0]) <= 0.6:
+                    return i + 1
+                world._init_gate()
     raise RuntimeError(f"no edge universe found in {tries} samples")
 
 
@@ -22,6 +35,8 @@ def accept(stats, band=(0.1, 0.65)):
         & (stats["linearity"] >= 0.4) & (stats["linearity"] <= 0.97)
         & (stats["sensitivity"] >= 0.05)
         & (stats["spread"] >= 30.0)
+        & (stats["climbable"] >= 0.999)
+        & (stats["bite"] <= 0.6)
     )
 
 
@@ -40,6 +55,42 @@ def stencil_fit(world, traj):
     res = (X @ W - Y).pow(2).flatten(1).sum(1)
     tot = (Y - Y.mean((1, 2), keepdim=True)).pow(2).flatten(1).sum(1)
     return 1 - res / tot.clamp_min(1e-9)
+
+
+def rungs_open(world):
+    # per-rung gate open-area fraction right now, with the tech tree rolled
+    # out hypothetically; > 0 means open somewhere
+    saved = world.properties, world.field_matter_affinity
+    props = world.properties.clone()
+    sens = world.field_matter_affinity.clone()
+    world.properties, world.field_matter_affinity = props, sens
+    num_nat = world.num_common_types + world.num_sparse_types
+    open_fracs = []
+    for t in range(num_nat, world.num_types):
+        flat = (world.craft_map == t).flatten(1).float().argmax(1)
+        a, b = flat // world.num_types, flat % world.num_types
+        props[:, t] = world._series(
+            torch.einsum(
+                "bijk,bj,bk->bi",
+                world.prop_tensor,
+                props[world.batch_idx, a],
+                props[world.batch_idx, b],
+            ),
+            world.chem_act,
+        )
+        sens[:, t] = world._series(
+            torch.einsum(
+                "bijk,bj,bk->bi",
+                world.sens_tensor,
+                sens[world.batch_idx, a],
+                sens[world.batch_idx, b],
+            ),
+            world.sens_act,
+        )
+        score = world.gate_score_map(a, b)
+        open_fracs.append((score > 0).flatten(1).float().mean(1))
+    world.properties, world.field_matter_affinity = saved
+    return torch.stack(open_fracs, dim=1)  # b, rungs
 
 
 def colour_spread(world):
@@ -66,9 +117,13 @@ def edge_stats(world, spin: int = 100, steps: int = 200, every: int = 4):
         for t in range(spin):
             world.step(t)
         rms = world.fields.pow(2).mean((1, 2, 3), keepdim=True).sqrt().clamp_min(1e-6)
+        rung_fracs = None
         for t in range(steps):
             world.step(spin + t)
             traj.append(world.fields.clone())
+            if t % 50 == 0:
+                fr = rungs_open(world)
+                rung_fracs = fr if rung_fracs is None else torch.maximum(rung_fracs, fr)
             if t % every == 0:
                 state = torch.cat(
                     [
@@ -96,6 +151,9 @@ def edge_stats(world, spin: int = 100, steps: int = 200, every: int = 4):
         persistence = 1 - res / tot.clamp_min(1e-9)
         linearity = stencil_fit(world, traj)
         spread = colour_spread(world)
+        rung_fracs = torch.maximum(rung_fracs, rungs_open(world))
+        climbable = (rung_fracs > 0).float().mean(1)
+        bite = rung_fracs.median(1).values
     frames = torch.stack(frames)
     complexity = torch.tensor(
         [
@@ -109,4 +167,6 @@ def edge_stats(world, spin: int = 100, steps: int = 200, every: int = 4):
         linearity=linearity,
         sensitivity=sens,
         spread=spread,
+        climbable=climbable,
+        bite=bite,
     )

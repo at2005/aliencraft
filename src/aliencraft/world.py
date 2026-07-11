@@ -37,6 +37,10 @@ class AlienCraftWorld(torch.nn.Module):
         "field_act2",
         "chem_act",
         "sens_act",
+        "gate_coeffs",
+        "craft_energy_scale",
+        "gate_ema_beta",
+        "rms_ema",
         "actuators",
     )
 
@@ -90,7 +94,6 @@ class AlienCraftWorld(torch.nn.Module):
 
         self.dt = 0.1
         self.damping = 0.90
-        self.craft_energy_scale = 1.0  # higher = harder glow gate
 
         ii, jj = torch.meshgrid(
             torch.arange(self.width, device=self.device),
@@ -225,7 +228,27 @@ class AlienCraftWorld(torch.nn.Module):
         self.field_act2 = self._sample_series()
         self.chem_act = self._sample_series()
         self.sens_act = self._sample_series()
+        self._init_gate()
         self.nca_state = torch.zeros(b, c, self.width, self.height, device=self.device)
+        self.rms_ema = torch.zeros(b, device=self.device)
+
+    def _init_gate(self):
+        # sampled gate law: how alignment and intensity trade off, how much
+        # activation energy mass costs, and the horizon of the ambient EMA
+        # the score is judged against (fields surging above their own recent
+        # average open gates world-wide; lulls close them)
+        self.gate_coeffs = torch.randn(self.batch_size, 2, device=self.device)
+        self.craft_energy_scale = torch.exp(
+            torch.empty(self.batch_size, device=self.device).uniform_(
+                math.log(0.5), math.log(8.0)
+            )
+        )
+        horizon = torch.exp(
+            torch.empty(self.batch_size, device=self.device).uniform_(
+                math.log(20.0), math.log(500.0)
+            )
+        )
+        self.gate_ema_beta = 1.0 / horizon
 
     def _init_distance_kernel(self):
         # sampled radial emission profile k(r), L1-normalised
@@ -593,7 +616,11 @@ class AlienCraftWorld(torch.nn.Module):
         h = self._series(self._nca_conv(x, self.nca_w1, self.nca_b1), self.field_act1)
         new = self._series(self._nca_conv(h, self.nca_w2, self.nca_b2), self.field_act2)
         self.nca_state = (1 - self.nca_alpha) * self.nca_state + self.nca_alpha * new
-        return self.nca_state[:, : self.num_fields].clone()
+        visible = self.nca_state[:, : self.num_fields]
+        rms = visible.pow(2).mean((1, 2, 3)).sqrt()
+        blended = (1 - self.gate_ema_beta) * self.rms_ema + self.gate_ema_beta * rms
+        self.rms_ema = torch.where(self.rms_ema == 0, rms, blended)
+        return visible.clone()
 
     def actuator_project(self, action: torch.Tensor):
         # action is b, action_dim
@@ -751,31 +778,43 @@ class AlienCraftWorld(torch.nn.Module):
 
         self.grid = new_grid.where(new_grid != -1, self.grid)
 
-    def craft_glow_gate(self, left_type, right_type):
-        # fires iff |g(a)+g(b)| > E: local field must align with the pair's
-        # coupling strongly enough for its mass; g is the pre-tanh shimmer
-        field_here = self.fields[
-            self.batch_idx, :, self.agent_position[..., 0], self.agent_position[..., 1]
-        ]  # b, num_fields
+    def gate_score_map(self, left_type, right_type):
+        # sampled gate law over ambient-relative local scalars: alignment of
+        # the field with the pair's coupling, raw field intensity, minus the
+        # pair's activation energy (abs of combined masses). Open where the
+        # score is positive.
         pair_affinity = (
             self.field_matter_affinity[self.batch_idx, left_type]
             + self.field_matter_affinity[self.batch_idx, right_type]
         )  # b, num_fields
-        glow = (pair_affinity * field_here).sum(-1).abs()
-        # E is relative to the ambient field level, so bite is invariant to
-        # field strength
-        field_rms = self.fields.pow(2).mean(dim=(1, 2, 3)).sqrt()
-        binding_energy = (
-            self.craft_energy_scale
-            * (
-                self.properties[self.batch_idx, left_type, 0]
-                + self.properties[self.batch_idx, right_type, 0]
-            ).abs()
-            * pair_affinity.norm(dim=-1)
-            * field_rms
-            / math.sqrt(self.num_fields)
+        rms = self.rms_ema.clamp_min(1e-6)
+        denom = (pair_affinity.norm(dim=-1) * rms).clamp_min(1e-6)
+        alignment = (
+            math.sqrt(self.num_fields)
+            * torch.einsum("bf,bfxy->bxy", pair_affinity, self.fields).abs()
+            / denom.view(-1, 1, 1)
         )
-        return glow > binding_energy
+        intensity = self.fields.norm(dim=1) / (
+            rms.view(-1, 1, 1) * math.sqrt(self.num_fields)
+        )
+        mass = (
+            self.properties[self.batch_idx, left_type, 0]
+            + self.properties[self.batch_idx, right_type, 0]
+        ).abs()
+        return (
+            self.gate_coeffs[:, 0].view(-1, 1, 1) * alignment
+            + self.gate_coeffs[:, 1].view(-1, 1, 1) * intensity
+            - (self.craft_energy_scale * mass).view(-1, 1, 1)
+        )
+
+    def craft_glow_gate(self, left_type, right_type):
+        score = self.gate_score_map(left_type, right_type)
+        return (
+            score[
+                self.batch_idx, self.agent_position[..., 0], self.agent_position[..., 1]
+            ]
+            > 0
+        )
 
     def render(self, agent_view=False):
         # render the universe with the sprites
