@@ -8,6 +8,7 @@ import pygame
 import torch
 
 from aliencraft import AlienCraftWorld
+from aliencraft.filter import accept, edge_stats
 
 SCALE = 3
 SIDEBAR = 220
@@ -25,6 +26,18 @@ world = AlienCraftWorld(
     num_common_types=4, num_sparse_types=1, num_properties=3, num_fields=3,
     sprite_resolution=4, visual_field_size=64, driven_fields=True,
 )
+
+
+def new_universe():
+    for i in range(24):
+        world.reset()
+        if bool(accept(edge_stats(world))[0]):
+            return
+        print(f"rejected universe {i + 1}, resampling")
+
+
+with torch.no_grad():
+    new_universe()
 
 
 def action_for(direction, place_type=None):
@@ -97,7 +110,7 @@ with torch.no_grad():
                     flash, flash_t = "craft failed", 20
                 pending = None
             elif k == pygame.K_r:
-                world.reset()
+                new_universe()
                 flash, flash_t = "new universe", 30
         if pending is not None:
             world.step(step, pending)

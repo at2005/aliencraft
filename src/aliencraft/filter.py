@@ -6,6 +6,16 @@ import torch
 import torch.nn.functional as F
 
 
+def accept(stats, band=(0.1, 0.65)):
+    return (
+        (stats["complexity"] >= band[0]) & (stats["complexity"] <= band[1])
+        & (stats["persistence"] >= 0.2) & (stats["persistence"] <= 0.995)
+        & (stats["linearity"] >= 0.4) & (stats["linearity"] <= 0.97)
+        & (stats["sensitivity"] >= 0.05)
+        & (stats["spread"] >= 30.0)
+    )
+
+
 def stencil_fit(world, traj):
     # ridge fit of a 3x3 linear stencil; R^2 near 1 = linear order,
     # near 0 = chaos, the edge lives between
