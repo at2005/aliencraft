@@ -1,9 +1,89 @@
 # generation filters: a sampled universe is kept only if these pass
 import copy
 import gzip
+import os
 
 import torch
 import torch.nn.functional as F
+
+# per-universe tensors that define a universe; everything else is state
+GENOME_KEYS = (
+    "grid", "agent_position", "properties", "field_matter_affinity",
+    "prop_tensor", "sens_tensor", "craft_map", "nca_w1", "nca_w2", "nca_b1",
+    "nca_b2", "nca_alpha", "field_act1", "field_act2", "chem_act", "sens_act",
+    "gate_coeffs", "craft_energy_scale", "gate_ema_beta", "distance_kernel",
+    "colour_projection", "field_colour_directions", "sprites", "actuators",
+)
+
+
+def snapshot_genome(world, i):
+    rec = {k: getattr(world, k)[i].detach().cpu().clone() for k in GENOME_KEYS}
+    rec["grid"] = rec["grid"].to(torch.uint8)
+    rec["craft_map"] = rec["craft_map"].to(torch.int16)
+    return rec
+
+
+def load_genome(world, record, spin=100):
+    with torch.no_grad():
+        world.reset()
+        for k in GENOME_KEYS:
+            getattr(world, k)[0] = record[k].to(world.device)
+        world.refresh_colour_palette()
+        for t in range(spin):
+            world.step(t)
+
+
+def generate_pool(path, n, batch_size=48, device="cpu", band=(0.1, 0.65), **world_kwargs):
+    # batched universe generation: dynamics filters once, gate redrawn
+    # blockwise; accepted genomes appended to a growing .pt file
+    from .env import DEFAULT_WORLD_KWARGS
+    from .world import AlienCraftWorld
+
+    records = torch.load(path) if os.path.exists(path) else []
+    kwargs = {**DEFAULT_WORLD_KWARGS, **world_kwargs}
+    world = AlienCraftWorld(batch_size=batch_size, device=device, **kwargs)
+    with torch.no_grad():
+        while len(records) < n:
+            world.reset()
+            init_grid = world.grid.detach().cpu().clone()
+            init_pos = world.agent_position.detach().cpu().clone()
+            stats = edge_stats(world)
+            ok = accept(
+                dict(
+                    stats,
+                    climbable=torch.ones_like(stats["climbable"]),
+                    bite=torch.zeros_like(stats["bite"]),
+                ),
+                band,
+            )
+            fr = rungs_open(world)
+            gate_ok = (fr > 0).all(1) & (fr.median(1).values <= 0.6)
+            for _ in range(60):
+                need = ok & ~gate_ok
+                if not need.any():
+                    break
+                old = (
+                    world.gate_coeffs.clone(),
+                    world.craft_energy_scale.clone(),
+                    world.gate_ema_beta.clone(),
+                )
+                world._init_gate()
+                keep = ~need
+                world.gate_coeffs[keep] = old[0][keep]
+                world.craft_energy_scale[keep] = old[1][keep]
+                world.gate_ema_beta[keep] = old[2][keep]
+                fr = rungs_open(world)
+                gate_ok = gate_ok | (
+                    need & (fr > 0).all(1) & (fr.median(1).values <= 0.6)
+                )
+            for i in (ok & gate_ok).nonzero().flatten().tolist():
+                rec = snapshot_genome(world, i)
+                rec["grid"] = init_grid[i].to(torch.uint8)
+                rec["agent_position"] = init_pos[i]
+                records.append(rec)
+            torch.save(records, path)
+            print(f"pool: {len(records)}/{n}", flush=True)
+    return records
 
 
 def sample_edge_world(world, band=(0.1, 0.65), tries=96, gate_tries=60):
