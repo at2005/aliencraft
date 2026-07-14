@@ -7,11 +7,12 @@ from gymnasium import spaces
 from .filter import load_laws, sample_edge_world
 from .world import AlienCraftWorld
 
-# naturals are 5% of the tech tree; the rest is a per-universe recipe DAG
+# slots are storage, not the tech tree: the reachable set is whatever the
+# sampled chemistry closes over, banded to [10, 300] by the filters
 DEFAULT_WORLD_KWARGS = dict(
     width=64,
     height=64,
-    num_types=100,
+    num_types=400,
     num_common_types=4,
     num_sparse_types=1,
     num_properties=3,
@@ -45,9 +46,9 @@ class AlienCraftEnv(gym.Env):
         self.observation_space = spaces.Box(
             0.0, 1.0, (obs_size, obs_size, 3), np.float32
         )
-        # 2 direction dims + num_types place-type logits
+        # 2 motion dims + num_properties pointer dims (nearest held type)
         self.action_space = spaces.Box(
-            -1.0, 1.0, (2 + self.world.num_types,), np.float32
+            -1.0, 1.0, (2 + self.world.num_properties,), np.float32
         )
         self._t = 0
 

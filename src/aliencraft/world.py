@@ -26,7 +26,9 @@ class AlienCraftWorld(torch.nn.Module):
         "colour_palette",
         "colour_projection",
         "field_colour_directions",
-        "craft_map",
+        "craft_f",
+        "craft_f_act",
+        "craft_thresh",
         "nca_w1",
         "nca_w2",
         "nca_b1",
@@ -37,11 +39,16 @@ class AlienCraftWorld(torch.nn.Module):
         "field_act2",
         "chem_act",
         "sens_act",
-        "gate_coeffs",
-        "craft_energy_scale",
+        "emission_vec",
+        "emission_act",
+        "force_tensor",
+        "force_act",
+        "gate_tensor",
+        "gate_act",
         "gate_ema_beta",
         "rms_ema",
         "actuators",
+        "pointer_actuator",
     )
 
     def __init__(
@@ -136,10 +143,12 @@ class AlienCraftWorld(torch.nn.Module):
         self.sens_tensor = self._init_mix_tensor(self.num_fields)
         self._init_nca()
 
-        # measures progress down the tech tree, true if the type has been discovered
+        # true if the type has been discovered; naturals start discovered,
+        # crafted types claim free slots in order
         self.tech_tree_progress = torch.zeros(
             self.batch_size, self.num_types, device=self.device
         ).bool()
+        self.tech_tree_progress[:, 1 : num_common_types + num_sparse_types] = True
 
         assert (
             self.visual_field_size % self.sprite_resolution == 0
@@ -161,7 +170,7 @@ class AlienCraftWorld(torch.nn.Module):
         self.init_sprites()
         self.create_colour_palette()
         self.create_actuators()
-        self.build_craft_map()
+        self._init_craft_law()
         self.seed_universe()
 
     def register_all_buffers(self):
@@ -217,28 +226,56 @@ class AlienCraftWorld(torch.nn.Module):
         self.nca_w2 = torch.randn(b, c, m, 3, 3, device=self.device) * gain / (m * 9) ** 0.5
         self.nca_b1 = torch.randn(b, m, device=self.device) * 0.5
         self.nca_b2 = torch.randn(b, c, device=self.device) * 0.5
+        # per-channel EMA rates down to ~200-step integrators: timescale
+        # separation is what lets sampled laws express slow modes and
+        # relaxation oscillations (tied single alpha provably cannot)
         self.nca_alpha = torch.exp(
-            torch.empty(b, 1, 1, 1, device=self.device).uniform_(math.log(0.05), 0.0)
+            torch.empty(b, c, 1, 1, device=self.device).uniform_(
+                math.log(0.005), 0.0
+            )
         )
         self.field_act1 = self._sample_series()
         self.field_act2 = self._sample_series()
         self.chem_act = self._sample_series()
         self.sens_act = self._sample_series()
+        # sampled emission law: strength = bounded series over the full
+        # property vector (no anointed mass coordinate); reciprocity kept —
+        # emission still points along the type's affinity
+        self.emission_vec = torch.randn(b, self.num_properties, device=self.device)
+        self.emission_act = self._sample_series()
+        # sampled locomotion law: bounded force from a bilinear coupling of
+        # the local field jet (gradients + values) with the cell type's
+        # affinity and properties; conservation and collisions stay fixed
+        # d_u/d_v are the derived input dims (field jet x type coupling);
+        # the fan-in root keeps the bilinear form at unit variance, and the
+        # gain — how nonlinear the sampled law runs — is itself sampled
+        d_u = 3 * f
+        d_v = f + self.num_properties
+        force_gain = torch.exp(
+            torch.empty(b, 1, 1, 1, device=self.device).uniform_(
+                math.log(1.25), math.log(20.0)
+            )
+        )
+        self.force_tensor = (
+            force_gain
+            * torch.randn(b, 2, d_u, d_v, device=self.device)
+            / (d_u * d_v) ** 0.5
+        )
+        self.force_act = self._sample_series()
         self._init_gate()
         self.nca_state = torch.zeros(b, c, self.width, self.height, device=self.device)
         self.rms_ema = torch.zeros(b, device=self.device)
 
     def _init_gate(self):
-        # sampled gate law: how alignment and intensity trade off, how much
-        # activation energy mass costs, and the horizon of the ambient EMA
-        # the score is judged against (fields surging above their own recent
-        # average open gates world-wide; lulls close them)
-        self.gate_coeffs = torch.randn(self.batch_size, 2, device=self.device)
-        self.craft_energy_scale = torch.exp(
-            torch.empty(self.batch_size, device=self.device).uniform_(
-                math.log(0.5), math.log(8.0)
+        d = 2 * self.num_fields + self.num_properties
+        gain = torch.exp(
+            torch.empty(self.batch_size, 1, 1, device=self.device).uniform_(
+                math.log(2.0), math.log(12.0)
             )
         )
+        g = torch.randn(self.batch_size, d, d, device=self.device)
+        self.gate_tensor = gain * 0.5 * (g + g.transpose(-1, -2)) / d
+        self.gate_act = self._sample_series()
         horizon = torch.exp(
             torch.empty(self.batch_size, device=self.device).uniform_(
                 math.log(20.0), math.log(500.0)
@@ -247,7 +284,7 @@ class AlienCraftWorld(torch.nn.Module):
         self.gate_ema_beta = 1.0 / horizon
 
     def _init_distance_kernel(self):
-        # sampled radial emission profile k(r), L1-normalised
+        # radially symmetric distance kernel
         ii, jj = torch.meshgrid(
             torch.arange(7, device=self.device),
             torch.arange(7, device=self.device),
@@ -262,11 +299,17 @@ class AlienCraftWorld(torch.nn.Module):
         self.distance_kernel = kernel / kernel.abs().sum((1, 2), keepdim=True).clamp_min(1e-6)
 
     def _init_mix_tensor(self, dim: int):
-        # zero-mean bilinear mixing, symmetric in the parents; gain 5 sits
-        # between chain collapse and binarisation (calibrated at dim 3)
+        # zero-mean bilinear mixing, symmetric in the parents; sampled gain
+        # (log-centred on the old calibrated 5) — the closure crafted/depth
+        # bands select against chain collapse and binarisation
+        gain = torch.exp(
+            torch.empty(self.batch_size, 1, 1, 1, device=self.device).uniform_(
+                math.log(2.0), math.log(12.0)
+            )
+        )
         tensor = torch.randn(self.batch_size, dim, dim, dim, device=self.device)
         tensor = 0.5 * (tensor + tensor.transpose(-1, -2))
-        return 5.0 * tensor / dim
+        return gain * tensor / dim
 
     def _init_field_matter_affinity(self, num_active_types: int):
         # per-universe random subset of field-coupled types
@@ -291,6 +334,19 @@ class AlienCraftWorld(torch.nn.Module):
 
         # test for invertibility, will throw runtime error if not invertible
         self.actuators.inverse()
+
+        # pointer actuator: rotation + log-uniform anisotropic scale over
+        # property space; eigenvalues in [1/2, 2] keep every type reachable
+        # from the [-1, 1] action box
+        p = self.num_properties
+        q = torch.linalg.qr(torch.randn(self.batch_size, p, p, device=self.device)).Q
+        s = torch.exp(
+            torch.empty(self.batch_size, p, device=self.device).uniform_(
+                math.log(0.5), math.log(2.0)
+            )
+        )
+        self.pointer_actuator = q @ (s.unsqueeze(-1) * q.transpose(1, 2))
+        self.pointer_actuator.inverse()
 
     def create_colour_palette(self):
         # colour = orthonormal projection of properties; a rotation at P=3,
@@ -340,55 +396,42 @@ class AlienCraftWorld(torch.nn.Module):
 
         self.sprites = perlin
 
-    def build_craft_map(self):
-        # per-universe recipe DAG: type t = recent parent + partner, where the
-        # partner is a crafted intermediate 15% of the time, else a common
-        assert self.num_common_types >= 2, "need a non-empty common type as partner"
-        num_natural = self.num_common_types + self.num_sparse_types
-        self.craft_map = torch.full(
-            (self.batch_size, self.num_types, self.num_types),
-            -1,
-            dtype=torch.long,
-            device=self.device,
-        )
-        for t in range(num_natural, self.num_types):
-            taken = torch.ones(self.batch_size, dtype=torch.bool, device=self.device)
-            parent = torch.zeros_like(self.batch_idx)
-            partner = torch.zeros_like(self.batch_idx)
-            while taken.any():
-                new_parent = torch.randint(
-                    max(1, t - 10), t, (self.batch_size,), device=self.device
-                )
-                crafted = (
-                    torch.rand(self.batch_size, device=self.device) < 0.15
-                ) & (t > num_natural)
-                new_partner = torch.where(
-                    crafted,
-                    torch.randint(
-                        num_natural,
-                        max(num_natural + 1, t),
-                        (self.batch_size,),
-                        device=self.device,
-                    ),
-                    torch.randint(
-                        1, self.num_common_types, (self.batch_size,), device=self.device
-                    ),
-                )
-                parent = torch.where(taken, new_parent, parent)
-                partner = torch.where(taken, new_partner, partner)
-                taken = self.craft_map[self.batch_idx, parent, partner] != -1
-            self.craft_map[self.batch_idx, parent, partner] = t
-            self.craft_map[self.batch_idx, partner, parent] = t
+    def _init_craft_law(self):
+        # craftability is a sampled symmetric law over the parents' observable properties
+        assert (
+            self.num_common_types + self.num_sparse_types >= 2
+        ), "need at least one non-empty natural type"
+        p = self.num_properties
+        f = torch.randn(self.batch_size, p, p, device=self.device)
+        self.craft_f = 0.5 * (f + f.transpose(-1, -2))
+        self.craft_f_act = self._sample_series()
+        self.craft_eps = 0.2
+        density = torch.empty(self.batch_size, device=self.device).uniform_(0.25, 0.40)
+        pa = torch.empty(self.batch_size, 4096, p, device=self.device).uniform_(-1, 1)
+        pb = torch.empty(self.batch_size, 4096, p, device=self.device).uniform_(-1, 1)
+        scores = self._series(
+            torch.einsum("bjk,bnj,bnk->bn", self.craft_f, pa, pb), self.craft_f_act
+        ).sort(dim=1).values
+        idx = ((1.0 - density) * (scores.shape[1] - 1)).long()
+        self.craft_thresh = scores[self.batch_idx, idx]
 
     def craft(
         self,
         mat1_type: torch.Tensor,  # b,
         mat2_type: torch.Tensor,  # b,
     ):
-        # you craft with two types to get a new type (-1 if no recipe matches)
-        new_type = self.craft_map[self.batch_idx, mat1_type, mat2_type]
+        # the craft law says whether the pair reacts; the chemistry law says
+        # what comes out: a known type if the result lands within craft_eps
+        # of one, else the next free slot (-1 if inert or slots exhausted)
         mat1_props = self.properties[self.batch_idx, mat1_type]
         mat2_props = self.properties[self.batch_idx, mat2_type]
+        reacts = (
+            self._series(
+                torch.einsum("bjk,bj,bk->b", self.craft_f, mat1_props, mat2_props),
+                self.craft_f_act,
+            )
+            > self.craft_thresh
+        ) & (mat1_type > 0) & (mat2_type > 0)
         inherited_props = self._series(
             torch.einsum("bijk,bj,bk->bi", self.prop_tensor, mat1_props, mat2_props),
             self.chem_act,
@@ -398,6 +441,16 @@ class AlienCraftWorld(torch.nn.Module):
         inherited_sens = self._series(
             torch.einsum("bijk,bj,bk->bi", self.sens_tensor, mat1_sens, mat2_sens),
             self.sens_act,
+        )
+        dist = (self.properties - inherited_props.unsqueeze(1)).norm(dim=-1)
+        dist = dist.masked_fill(~self.tech_tree_progress, torch.inf)
+        match_dist, match_idx = dist.min(dim=1)
+        matched = match_dist < self.craft_eps
+        num_natural = self.num_common_types + self.num_sparse_types
+        free = ~self.tech_tree_progress[:, num_natural:]
+        new_type = torch.where(matched, match_idx, num_natural + free.long().argmax(1))
+        new_type = torch.where(
+            reacts & (matched | free.any(1)), new_type, torch.full_like(new_type, -1)
         )
         return new_type, inherited_props, inherited_sens
 
@@ -474,11 +527,18 @@ class AlienCraftWorld(torch.nn.Module):
         return c
 
     def seed_universe(self):
+        # layout statistics reroll with the layout: terrain correlation
+        # length and sparse density are sampled per reset, crafter-style
+        scale_mult = torch.exp(
+            torch.empty(self.batch_size, 1, 1, 1, device=self.device).uniform_(
+                math.log(0.4), math.log(2.5)
+            )
+        )
         fields = []
         for i in range(self.num_common_types):
             seed = torch.randint(0, 1000000, (self.batch_size,), device=self.device)
             perlin = self.perlin(
-                scale=0.05 / (0.5 * math.sqrt(i + 1)),
+                scale=scale_mult * (0.05 / (0.5 * math.sqrt(i + 1))),
                 positions=self.positions,
                 seed=seed,
             )
@@ -490,9 +550,14 @@ class AlienCraftWorld(torch.nn.Module):
         fields = torch.stack(fields, dim=-1)  # b, h, w, num_types
         grid = fields.argmax(dim=-1)  # b, h, w
 
+        sparse_density = torch.exp(
+            torch.empty(self.batch_size, 1, 1, device=self.device).uniform_(
+                math.log(0.003), math.log(0.03)
+            )
+        )
         sparse_mask = (
             torch.rand(self.batch_size, self.width, self.height, device=self.device)
-            < 0.01
+            < sparse_density
         )
         rare_types = torch.randint(
             self.num_common_types,
@@ -517,8 +582,11 @@ class AlienCraftWorld(torch.nn.Module):
         return is_occupied
 
     def move(self, grid: torch.Tensor, velocity: torch.Tensor, step: int):
-        new_positions = self.positions + velocity * self.dt
-        new_positions = (new_positions.floor().long()) % self.width  # b, h, w, 2
+        # dt is already integrated into velocity; round keeps sub-threshold
+        # matter in place symmetrically (floor moved anything with the
+        # slightest negative velocity a full cell per step)
+        new_positions = self.positions + velocity
+        new_positions = (new_positions.round().long()) % self.width  # b, h, w, 2
         new_grid = torch.zeros_like(grid)
 
         is_occupied = self.occupany_function(grid, new_positions)
@@ -559,19 +627,28 @@ class AlienCraftWorld(torch.nn.Module):
         return new_grid
 
     def step_grid(self, step: int):
-        # compute forces for each cell
-        # field_matter_affinity is b, num_types, num_fields
-        affinity: torch.Tensor = self.field_matter_affinity[
+        # sampled locomotion law: force = bounded series over a bilinear
+        # coupling of the local field jet with the cell type's affinity and
+        # properties (gradient descent is one point in this family)
+        affinity = self.field_matter_affinity[
             self.batch_idx.view(-1, 1, 1), self.grid
         ]  # b, h, w, num_fields
-        affinity = affinity.unsqueeze(-2)  # b, h, w, 1, num_fields
-        field_force = -self.differential.grad(self.fields)  # b, 2, num_fields, h, w
-        field_force = field_force.permute(0, 3, 4, 1, 2)  # b, h, w, 2, num_fields
-        field_force_weighted = (field_force * affinity).sum(dim=-1)  # b, h, w, 2
+        props = self.properties[self.batch_idx.view(-1, 1, 1), self.grid]
+        grad = self.differential.grad(self.fields)  # b, 2, num_fields, h, w
+        jet = torch.cat(
+            [
+                grad.reshape(
+                    self.batch_size, 2 * self.num_fields, self.width, self.height
+                ),
+                self.fields,
+            ],
+            dim=1,
+        )  # b, 3F, h, w
+        coupling = torch.cat([affinity, props], dim=-1)  # b, h, w, F + P
+        q = torch.einsum("bjcd,bchw,bhwd->bjhw", self.force_tensor, jet, coupling)
+        force = self._series(q, self.force_act).permute(0, 2, 3, 1)  # b, h, w, 2
 
-        self.grid_velocity = (
-            self.damping * self.grid_velocity + field_force_weighted * self.dt
-        )
+        self.grid_velocity = self.damping * self.grid_velocity + force * self.dt
         return self.move(self.grid, self.grid_velocity, step)
 
     def _nca_conv(self, x, w, bias):
@@ -601,9 +678,14 @@ class AlienCraftWorld(torch.nn.Module):
                 padding=3,
                 groups=b * t,
             ).reshape(b, t, h, w)
-        # any positive constant here cancels in the std normalisation below
+        # emission strength is a sampled law over the full property vector;
+        # any positive constant cancels in the std normalisation below
+        emission = self._series(
+            torch.einsum("btp,bp->bt", self.properties, self.emission_vec),
+            self.emission_act,
+        )  # b, num_types
         source = (
-            self.properties[..., 0].unsqueeze(-1) * self.field_matter_affinity
+            emission.unsqueeze(-1) * self.field_matter_affinity
         )  # b, num_types, num_fields
         src = torch.einsum("btxy,btf->bfxy", grid, source)
         src = src / src.flatten(1).std(dim=1).clamp_min(1e-6).view(-1, 1, 1, 1)
@@ -618,22 +700,20 @@ class AlienCraftWorld(torch.nn.Module):
         return visible.clone()
 
     def actuator_project(self, action: torch.Tensor):
-        # action is b, action_dim
-        # we feed the continuous action into an actuator that is altered per-universe
-        # how do we handle non motion actions? we project through the actuator to
-        # get the type of the action. the actions can be:
-        # - move in a direction
-        # - pick/place an object (which should be described by two separate vectors)
-        # - craft an object
-        # - noop
+        # action = 2 motion dims + num_properties pointer dims, both through
+        # per-universe actuators. The pointer selects the nearest held type
+        # in property space: types are addressed by what they are, not by
+        # slot index, and craft_eps keeps distinct types addressable
         direction = action[..., :2]  # b, 2
-        # type of object to place
-        place_type = action[..., 2 : 2 + self.num_types]
+        pointer = action[..., 2 : 2 + self.num_properties]  # b, num_properties
         direction = self.actuators @ direction.unsqueeze(-1)  # b, 2, 1
         direction = direction.squeeze(-1)  # b, 2
         direction = direction / (direction.norm(dim=-1, keepdim=True) + 1e-8)
 
-        argmaxxed_place_type = place_type.argmax(dim=-1)
+        pointer = (self.pointer_actuator @ pointer.unsqueeze(-1)).squeeze(-1)
+        dist = (self.properties - pointer.unsqueeze(1)).norm(dim=-1)  # b, num_types
+        dist = dist.masked_fill(self.agent_inventory <= 0, torch.inf)
+        pointed_place_type = dist.argmin(dim=-1)
 
         isqrt2 = 1.0 / math.sqrt(2)
         directions_to_project = torch.tensor(
@@ -664,7 +744,7 @@ class AlienCraftWorld(torch.nn.Module):
             pick_mask,
             place_mask,
             directions_to_project[0, argmax_direction % 4].long(),
-            argmaxxed_place_type,
+            pointed_place_type,
         )
 
     def apply_action(self, action: torch.Tensor):
@@ -774,33 +854,30 @@ class AlienCraftWorld(torch.nn.Module):
         self.grid = new_grid.where(new_grid != -1, self.grid)
 
     def gate_score_map(self, left_type, right_type):
-        # sampled gate law over ambient-relative local scalars: alignment of
-        # the field with the pair's coupling, raw field intensity, minus the
-        # pair's activation energy (abs of combined masses). Open where the
-        # score is positive.
-        pair_affinity = (
-            self.field_matter_affinity[self.batch_idx, left_type]
-            + self.field_matter_affinity[self.batch_idx, right_type]
-        )  # b, num_fields
-        rms = self.rms_ema.clamp_min(1e-6)
-        denom = (pair_affinity.norm(dim=-1) * rms).clamp_min(1e-6)
-        alignment = (
-            math.sqrt(self.num_fields)
-            * torch.einsum("bf,bfxy->bxy", pair_affinity, self.fields).abs()
-            / denom.view(-1, 1, 1)
-        )
-        intensity = self.fields.norm(dim=1) / (
-            rms.view(-1, 1, 1) * math.sqrt(self.num_fields)
-        )
-        mass = (
-            self.properties[self.batch_idx, left_type, 0]
-            + self.properties[self.batch_idx, right_type, 0]
-        ).abs()
-        return (
-            self.gate_coeffs[:, 0].view(-1, 1, 1) * alignment
-            + self.gate_coeffs[:, 1].view(-1, 1, 1) * intensity
-            - (self.craft_energy_scale * mass).view(-1, 1, 1)
-        )
+        # sampled gate law over [local fields / ambient EMA, pair affinity,
+        # pair properties], symmetric in the pair; open where positive
+        rms = self.rms_ema.clamp_min(1e-6).view(-1, 1, 1, 1)
+        u = self.fields / (rms * math.sqrt(self.num_fields))  # b, F, h, w
+        pair = torch.cat(
+            [
+                self.field_matter_affinity[self.batch_idx, left_type]
+                + self.field_matter_affinity[self.batch_idx, right_type],
+                self.properties[self.batch_idx, left_type]
+                + self.properties[self.batch_idx, right_type],
+            ],
+            dim=-1,
+        )  # b, F + P
+        z = torch.cat(
+            [
+                u,
+                pair.unsqueeze(-1)
+                .unsqueeze(-1)
+                .expand(-1, -1, self.width, self.height),
+            ],
+            dim=1,
+        )  # b, 2F + P, h, w
+        q = torch.einsum("bij,bixy,bjxy->bxy", self.gate_tensor, z, z)
+        return self._series(q, self.gate_act)
 
     def craft_glow_gate(self, left_type, right_type):
         score = self.gate_score_map(left_type, right_type)
@@ -923,6 +1000,9 @@ class AlienCraftWorld(torch.nn.Module):
             self.tech_tree_progress = torch.zeros(
                 self.batch_size, self.num_types, device=self.device
             ).bool()
+            self.tech_tree_progress[
+                :, 1 : self.num_common_types + self.num_sparse_types
+            ] = True
             self.properties = torch.zeros(
                 self.batch_size, self.num_types, self.num_properties, device=self.device
             )
@@ -945,5 +1025,5 @@ class AlienCraftWorld(torch.nn.Module):
             self.init_sprites()
             self.create_colour_palette()
             self.create_actuators()
-            self.build_craft_map()
+            self._init_craft_law()
             self.seed_universe()

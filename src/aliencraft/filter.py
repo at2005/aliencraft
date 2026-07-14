@@ -10,17 +10,18 @@ import torch.nn.functional as F
 # start) is rerolled fresh on every load, crafter-style
 LAW_KEYS = (
     "properties", "field_matter_affinity",
-    "prop_tensor", "sens_tensor", "craft_map", "nca_w1", "nca_w2", "nca_b1",
+    "prop_tensor", "sens_tensor", "craft_f", "craft_f_act", "craft_thresh",
+    "nca_w1", "nca_w2", "nca_b1",
     "nca_b2", "nca_alpha", "field_act1", "field_act2", "chem_act", "sens_act",
-    "gate_coeffs", "craft_energy_scale", "gate_ema_beta", "distance_kernel",
+    "emission_vec", "emission_act", "force_tensor", "force_act",
+    "gate_tensor", "gate_act", "gate_ema_beta", "distance_kernel",
     "colour_projection", "field_colour_directions", "sprites", "actuators",
+    "pointer_actuator",
 )
 
 
 def snapshot_laws(world, i):
-    rec = {k: getattr(world, k)[i].detach().cpu().clone() for k in LAW_KEYS}
-    rec["craft_map"] = rec["craft_map"].to(torch.int16)
-    return rec
+    return {k: getattr(world, k)[i].detach().cpu().clone() for k in LAW_KEYS}
 
 
 def load_laws(world, record, spin=100):
@@ -31,6 +32,152 @@ def load_laws(world, record, spin=100):
         world.refresh_colour_palette()
         for t in range(spin):
             world.step(t)
+
+
+def _series1(world, i, x, act):
+    return world._series(x.unsqueeze(0), act[i : i + 1]).squeeze(0)
+
+
+def closure(world, max_rounds=30):
+    # hypothetical closure of the naturals under the chemistry + craft laws:
+    # which types are reachable, at what depth, by which first recipe.
+    # Dedup order mirrors the runtime allocation, so a climb that replays
+    # `pairs` in order lands each child in its listed slot.
+    num_nat = world.num_common_types + world.num_sparse_types
+    cap = world.num_types - num_nat
+    out = []
+    for i in range(world.batch_size):
+        props = world.properties[i, 1:num_nat].clone()
+        sens = world.field_matter_affinity[i, 1:num_nat].clone()
+        slots = torch.arange(1, num_nat, device=world.device)
+        depth = torch.zeros(num_nat - 1, dtype=torch.long, device=world.device)
+        pairs = []
+        capped = False
+        for _ in range(max_rounds):
+            n = props.shape[0]
+            ii, jj = torch.triu_indices(n, n, 0, device=world.device)
+            score = _series1(
+                world, i,
+                torch.einsum("jk,nj,nk->n", world.craft_f[i], props[ii], props[jj]),
+                world.craft_f_act,
+            )
+            ok = score > world.craft_thresh[i]
+            if capped or not ok.any():
+                break
+            ii, jj = ii[ok], jj[ok]
+            child = _series1(
+                world, i,
+                torch.einsum("ijk,nj,nk->ni", world.prop_tensor[i], props[ii], props[jj]),
+                world.chem_act,
+            )
+            child_sens = _series1(
+                world, i,
+                torch.einsum("ijk,nj,nk->ni", world.sens_tensor[i], sens[ii], sens[jj]),
+                world.sens_act,
+            )
+            cdepth = torch.maximum(depth[ii], depth[jj]) + 1
+            fresh = (
+                (torch.cdist(child, props).min(1).values >= world.craft_eps)
+                .nonzero()
+                .flatten()
+            )
+            added = 0
+            for k in fresh.tolist():
+                if capped or (child[k] - props).norm(dim=-1).min() < world.craft_eps:
+                    continue
+                slot = num_nat + len(pairs)
+                pairs.append((int(slots[ii[k]]), int(slots[jj[k]]), slot))
+                props = torch.cat([props, child[k : k + 1]])
+                sens = torch.cat([sens, child_sens[k : k + 1]])
+                slots = torch.cat([slots, torch.tensor([slot], device=world.device)])
+                depth = torch.cat([depth, cdepth[k : k + 1]])
+                added += 1
+                capped = len(pairs) >= cap
+            if added == 0:
+                break
+        rgb = 255 * (0.5 + 0.35 * torch.tanh(props @ world.colour_projection[i]))
+        d = (rgb.unsqueeze(1) - rgb.unsqueeze(0)).abs().amax(-1)
+        iu = torch.triu_indices(props.shape[0], props.shape[0], 1)
+        out.append(
+            dict(
+                props=props,
+                sens=sens,
+                depth=depth,
+                capped=capped,
+                pairs=torch.tensor(pairs, dtype=torch.long).reshape(-1, 3),
+                spread=float(d[iu[0], iu[1]].median()) if props.shape[0] > 1 else 0.0,
+            )
+        )
+    return out
+
+
+def gate_fracs(world, closures):
+    # open-area fraction of each closure recipe's gate right now, with the
+    # hypothetical types written into their slots
+    num_nat = world.num_common_types + world.num_sparse_types
+    saved = world.properties.clone(), world.field_matter_affinity.clone()
+    counts = [cl["pairs"].shape[0] for cl in closures]
+    for i, cl in enumerate(closures):
+        world.properties[i, num_nat : num_nat + counts[i]] = cl["props"][num_nat - 1 :]
+        world.field_matter_affinity[i, num_nat : num_nat + counts[i]] = cl["sens"][
+            num_nat - 1 :
+        ]
+    fr = torch.zeros(world.batch_size, max(max(counts), 1), device=world.device)
+    valid = torch.zeros_like(fr, dtype=torch.bool)
+    a = torch.ones(world.batch_size, dtype=torch.long, device=world.device)
+    b = torch.ones_like(a)
+    for k in range(fr.shape[1]):
+        for i, cl in enumerate(closures):
+            if k < counts[i]:
+                a[i], b[i] = cl["pairs"][k, 0], cl["pairs"][k, 1]
+                valid[i, k] = True
+        score = world.gate_score_map(a, b)
+        fr[:, k] = (score > 0).flatten(1).float().mean(1)
+    world.properties, world.field_matter_affinity = saved
+    return fr, valid
+
+
+def _gate_snapshots(world, k=5, every=25):
+    # field-state snapshots for scoring gate redraws; the dynamics don't
+    # depend on the gate law, so one trajectory serves every redraw
+    snaps = []
+    for _ in range(k):
+        for t in range(every):
+            world.step(t)
+        snaps.append((world.fields.clone(), world.rms_ema.clone()))
+    return snaps
+
+
+def _gate_over_snapshots(world, closures, snaps):
+    saved = world.fields, world.rms_ema
+    frs = []
+    for fields, rms in snaps:
+        world.fields, world.rms_ema = fields, rms
+        fr, valid = gate_fracs(world, closures)
+        frs.append(fr)
+    world.fields, world.rms_ema = saved
+    return torch.stack(frs), valid  # k, b, recipes
+
+
+def _gate_stats(fr, valid):
+    # per-universe over k snapshots: frac_gates_ever_open = union coverage (every
+    # recipe opens at some snapshot), min_frac_gates_open = worst per-snapshot open
+    # fraction (the frontier never fully closes), median_gate_open_area =
+    # median over recipes of each recipe's best-snapshot open area
+    frac_gates_ever_open, min_frac_gates_open, median_gate_open_area = [], [], []
+    for i in range(fr.shape[1]):
+        v = valid[i]
+        if not v.any():
+            zero = fr.new_tensor(0.0)
+            frac_gates_ever_open.append(zero)
+            min_frac_gates_open.append(zero)
+            median_gate_open_area.append(zero)
+            continue
+        f = fr[:, i, v]  # k, recipes
+        frac_gates_ever_open.append((f > 0).any(0).float().mean())
+        min_frac_gates_open.append((f > 0).float().mean(1).min())
+        median_gate_open_area.append(f.max(0).values.median())
+    return torch.stack(frac_gates_ever_open), torch.stack(min_frac_gates_open), torch.stack(median_gate_open_area)
 
 
 def generate_pool(path, n, batch_size=48, device="cpu", band=(0.1, 0.65), **world_kwargs):
@@ -49,30 +196,35 @@ def generate_pool(path, n, batch_size=48, device="cpu", band=(0.1, 0.65), **worl
             ok = accept(
                 dict(
                     stats,
-                    climbable=torch.ones_like(stats["climbable"]),
-                    bite=torch.zeros_like(stats["bite"]),
+                    frac_gates_ever_open=torch.ones_like(stats["frac_gates_ever_open"]),
+                    min_frac_gates_open=torch.ones_like(stats["min_frac_gates_open"]),
+                    median_gate_open_area=torch.zeros_like(stats["median_gate_open_area"]),
                 ),
                 band,
             )
-            fr = rungs_open(world)
-            gate_ok = (fr > 0).all(1) & (fr.median(1).values <= 0.6)
+            cl = closure(world)
+            snaps = _gate_snapshots(world)
+            fr, valid = _gate_over_snapshots(world, cl, snaps)
+            frac_gates_ever_open, min_frac_gates_open, median_gate_open_area = _gate_stats(fr, valid)
+            gate_ok = (frac_gates_ever_open >= 0.999) & (min_frac_gates_open >= 0.25) & (median_gate_open_area <= 0.6)
             for _ in range(60):
                 need = ok & ~gate_ok
                 if not need.any():
                     break
                 old = (
-                    world.gate_coeffs.clone(),
-                    world.craft_energy_scale.clone(),
+                    world.gate_tensor.clone(),
+                    world.gate_act.clone(),
                     world.gate_ema_beta.clone(),
                 )
                 world._init_gate()
                 keep = ~need
-                world.gate_coeffs[keep] = old[0][keep]
-                world.craft_energy_scale[keep] = old[1][keep]
+                world.gate_tensor[keep] = old[0][keep]
+                world.gate_act[keep] = old[1][keep]
                 world.gate_ema_beta[keep] = old[2][keep]
-                fr = rungs_open(world)
+                fr, valid = _gate_over_snapshots(world, cl, snaps)
+                frac_gates_ever_open, min_frac_gates_open, median_gate_open_area = _gate_stats(fr, valid)
                 gate_ok = gate_ok | (
-                    need & (fr > 0).all(1) & (fr.median(1).values <= 0.6)
+                    need & (frac_gates_ever_open >= 0.999) & (min_frac_gates_open >= 0.25) & (median_gate_open_area <= 0.6)
                 )
             for i in (ok & gate_ok).nonzero().flatten().tolist():
                 records.append(snapshot_laws(world, i))
@@ -81,23 +233,31 @@ def generate_pool(path, n, batch_size=48, device="cpu", band=(0.1, 0.65), **worl
     return records
 
 
-def sample_edge_world(world, band=(0.1, 0.65), tries=96, gate_tries=60):
-    # dynamics filters don't depend on the gate law, so the gate is
-    # resampled blockwise on worlds whose dynamics already passed
+def sample_edge_world(world, band=(0.1, 0.65), tries=288, gate_tries=60):
+    # dynamics + closure filters don't depend on the gate law, so the gate
+    # is resampled blockwise on worlds that already passed
     with torch.no_grad():
         for i in range(tries):
             world.reset()
             stats = edge_stats(world)
             stats_sans_gate = dict(
                 stats,
-                climbable=torch.ones_like(stats["climbable"]),
-                bite=torch.zeros_like(stats["bite"]),
+                frac_gates_ever_open=torch.ones_like(stats["frac_gates_ever_open"]),
+                min_frac_gates_open=torch.ones_like(stats["min_frac_gates_open"]),
+                median_gate_open_area=torch.zeros_like(stats["median_gate_open_area"]),
             )
             if not bool(accept(stats_sans_gate, band)[0]):
                 continue
+            cl = closure(world)
+            snaps = _gate_snapshots(world)
             for _ in range(gate_tries):
-                fr = rungs_open(world)
-                if bool((fr > 0).all(1)[0]) and float(fr.median(1).values[0]) <= 0.6:
+                fr, valid = _gate_over_snapshots(world, cl, snaps)
+                frac_gates_ever_open, min_frac_gates_open, median_gate_open_area = _gate_stats(fr, valid)
+                if (
+                    bool(frac_gates_ever_open[0] >= 0.999)
+                    and float(min_frac_gates_open[0]) >= 0.25
+                    and float(median_gate_open_area[0]) <= 0.6
+                ):
                     return i + 1
                 world._init_gate()
     raise RuntimeError(f"no edge universe found in {tries} samples")
@@ -109,9 +269,13 @@ def accept(stats, band=(0.1, 0.65)):
         & (stats["persistence"] >= 0.2) & (stats["persistence"] <= 0.995)
         & (stats["linearity"] >= 0.4) & (stats["linearity"] <= 0.97)
         & (stats["sensitivity"] >= 0.05)
+        & (stats["mobility"] >= 0.05) & (stats["mobility"] <= 0.95)
         & (stats["spread"] >= 30.0)
-        & (stats["climbable"] >= 0.999)
-        & (stats["bite"] <= 0.6)
+        & (stats["crafted"] >= 10) & (stats["crafted"] <= 300)
+        & (stats["depth"] >= 3)
+        & (stats["frac_gates_ever_open"] >= 0.999)
+        & (stats["min_frac_gates_open"] >= 0.25)
+        & (stats["median_gate_open_area"] <= 0.6)
     )
 
 
@@ -132,73 +296,21 @@ def stencil_fit(world, traj):
     return 1 - res / tot.clamp_min(1e-9)
 
 
-def rungs_open(world):
-    # per-rung gate open-area fraction right now, with the tech tree rolled
-    # out hypothetically; > 0 means open somewhere
-    saved = world.properties, world.field_matter_affinity
-    props = world.properties.clone()
-    sens = world.field_matter_affinity.clone()
-    world.properties, world.field_matter_affinity = props, sens
-    num_nat = world.num_common_types + world.num_sparse_types
-    open_fracs = []
-    for t in range(num_nat, world.num_types):
-        flat = (world.craft_map == t).flatten(1).float().argmax(1)
-        a, b = flat // world.num_types, flat % world.num_types
-        props[:, t] = world._series(
-            torch.einsum(
-                "bijk,bj,bk->bi",
-                world.prop_tensor,
-                props[world.batch_idx, a],
-                props[world.batch_idx, b],
-            ),
-            world.chem_act,
-        )
-        sens[:, t] = world._series(
-            torch.einsum(
-                "bijk,bj,bk->bi",
-                world.sens_tensor,
-                sens[world.batch_idx, a],
-                sens[world.batch_idx, b],
-            ),
-            world.sens_act,
-        )
-        score = world.gate_score_map(a, b)
-        open_fracs.append((score > 0).flatten(1).float().mean(1))
-    world.properties, world.field_matter_affinity = saved
-    return torch.stack(open_fracs, dim=1)  # b, rungs
-
-
-def colour_spread(world):
-    # median pairwise colour distance across the rolled-out tech tree
-    props = world.properties.clone()
-    for t in range(world.num_common_types + world.num_sparse_types, world.num_types):
-        flat = (world.craft_map == t).flatten(1).float().argmax(1)
-        pa = props[world.batch_idx, flat // world.num_types]
-        pb = props[world.batch_idx, flat % world.num_types]
-        props[:, t] = world._series(
-            torch.einsum("bijk,bj,bk->bi", world.prop_tensor, pa, pb), world.chem_act
-        )
-    rgb = 255 * (0.5 + 0.35 * torch.tanh(props @ world.colour_projection))
-    d = (rgb.unsqueeze(2) - rgb.unsqueeze(1)).abs().amax(-1)
-    iu = torch.triu_indices(world.num_types, world.num_types, 1, device=world.device)
-    return d[:, iu[0], iu[1]].median(1).values
-
-
 def edge_stats(world, spin: int = 100, steps: int = 200, every: int = 4):
     # gzip complexity, one-step persistence, linear predictability, source
-    # sensitivity vs a massless ghost, colour spread
+    # sensitivity vs a silent ghost, closure reach/depth/colour spread
     frames, traj = [], []
     with torch.no_grad():
         for t in range(spin):
             world.step(t)
         rms = world.fields.pow(2).mean((1, 2, 3), keepdim=True).sqrt().clamp_min(1e-6)
-        rung_fracs = None
+        cl = closure(world)
+        snaps = [(world.fields.clone(), world.rms_ema.clone())]
         for t in range(steps):
             world.step(spin + t)
             traj.append(world.fields.clone())
             if t % 50 == 0:
-                fr = rungs_open(world)
-                rung_fracs = fr if rung_fracs is None else torch.maximum(rung_fracs, fr)
+                snaps.append((world.fields.clone(), world.rms_ema.clone()))
             if t % every == 0:
                 state = torch.cat(
                     [
@@ -212,7 +324,9 @@ def edge_stats(world, spin: int = 100, steps: int = 200, every: int = 4):
                 )
                 frames.append(state.cpu())
         ghost = copy.deepcopy(world)
-        ghost.properties[..., 0] = 0.0
+        # silent ghost: zero the emission series' amplitudes so matter
+        # sources nothing, then measure how much the fields care
+        ghost.emission_act[:, 0] = 0.0
         for t in range(30):
             world.step(spin + steps + t)
             ghost.step(spin + steps + t)
@@ -225,10 +339,9 @@ def edge_stats(world, spin: int = 100, steps: int = 200, every: int = 4):
         )
         persistence = 1 - res / tot.clamp_min(1e-9)
         linearity = stencil_fit(world, traj)
-        spread = colour_spread(world)
-        rung_fracs = torch.maximum(rung_fracs, rungs_open(world))
-        climbable = (rung_fracs > 0).float().mean(1)
-        bite = rung_fracs.median(1).values
+        snaps.append((world.fields.clone(), world.rms_ema.clone()))
+        fr, valid = _gate_over_snapshots(world, cl, snaps)
+        frac_gates_ever_open, min_frac_gates_open, median_gate_open_area = _gate_stats(fr, valid)
     frames = torch.stack(frames)
     complexity = torch.tensor(
         [
@@ -237,12 +350,25 @@ def edge_stats(world, spin: int = 100, steps: int = 200, every: int = 4):
         ],
         device=world.device,
     )
+    # matter mobility: fraction of initially-occupied cells whose content
+    # ever changes (the gzip band can't see this — grid is 1 of 4 channels
+    # and the churning field bytes mask a frozen one)
+    g = frames[:, :, 0]  # T, b, h, w
+    alive = g[0] > 0
+    moved = ((g != g[0]).any(0) & alive).flatten(1).sum(1)
+    mobility = (moved / alive.flatten(1).sum(1).clamp_min(1)).to(world.device)
+    dev = world.device
     return dict(
         complexity=complexity,
         persistence=persistence,
         linearity=linearity,
         sensitivity=sens,
-        spread=spread,
-        climbable=climbable,
-        bite=bite,
+        spread=torch.tensor([c["spread"] for c in cl], device=dev),
+        mobility=mobility,
+        crafted=torch.tensor([c["pairs"].shape[0] for c in cl], device=dev),
+        capped=torch.tensor([c["capped"] for c in cl], device=dev),
+        depth=torch.tensor([int(c["depth"].max()) for c in cl], device=dev),
+        frac_gates_ever_open=frac_gates_ever_open,
+        min_frac_gates_open=min_frac_gates_open,
+        median_gate_open_area=median_gate_open_area,
     )

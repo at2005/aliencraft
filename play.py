@@ -22,7 +22,7 @@ OCTANT = {
 
 torch.manual_seed(0)
 world = AlienCraftWorld(
-    batch_size=1, device="cpu", width=64, height=64, num_types=100,
+    batch_size=1, device="cpu", width=64, height=64, num_types=400,
     num_common_types=4, num_sparse_types=1, num_properties=3, num_fields=3,
     sprite_resolution=4, visual_field_size=64, driven_fields=True,
 )
@@ -37,10 +37,12 @@ new_universe()
 
 
 def action_for(direction, place_type=None):
-    a = torch.zeros(1, 2 + world.num_types)
+    a = torch.zeros(1, 2 + world.num_properties)
     a[0, :2] = torch.linalg.inv(world.actuators[0]) @ direction
     if place_type is not None:
-        a[0, 2 + place_type] = 1.0
+        a[0, 2:] = torch.linalg.inv(world.pointer_actuator[0]) @ world.properties[
+            0, place_type
+        ]
     return a
 
 
@@ -134,9 +136,9 @@ with torch.no_grad():
             screen, (255, 255, 255), (ax * cell, ay * cell, cell, cell), 2
         )
         l, r = neighbours()
+        child = int(world.craft(torch.tensor([l]), torch.tensor([r]))[0][0])
         ready = (
-            l and r
-            and int(world.craft_map[0, l, r]) != -1
+            child != -1
             and bool(world.craft_glow_gate(torch.tensor([l]), torch.tensor([r]))[0])
         )
         if ready:
@@ -147,17 +149,23 @@ with torch.no_grad():
             )
 
         # sidebar: discoveries, craft readout, inventory
-        ui = [f"discovered: {int(world.tech_tree_progress[0].sum())}/95"]
+        ui = [
+            f"discovered: {int(world.tech_tree_progress[0].sum())}"
+            f"/{world.num_types - 1}"
+        ]
         l, r = neighbours()
         if l and r:
-            recipe = int(world.craft_map[0, l, r])
             gate = bool(
                 world.craft_glow_gate(
                     torch.tensor([l]), torch.tensor([r])
                 )[0]
             )
+            known = child != -1 and bool(world.tech_tree_progress[0, child])
             ui.append(f"pair {l}+{r}:")
-            ui.append(f"  recipe: {'-> ' + str(recipe) if recipe != -1 else 'none'}")
+            if child == -1:
+                ui.append("  inert")
+            else:
+                ui.append(f"  reacts -> {'type ' + str(child) if known else 'NEW'}")
             ui.append(f"  gate: {'OPEN' if gate else 'closed'}")
         else:
             ui.append("stand between two")
