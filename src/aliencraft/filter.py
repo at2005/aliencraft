@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 # per-universe tensors that define a universe's laws; layout (grid, agent
 # start) is rerolled fresh on every load, crafter-style
-GENOME_KEYS = (
+LAW_KEYS = (
     "properties", "field_matter_affinity",
     "prop_tensor", "sens_tensor", "craft_map", "nca_w1", "nca_w2", "nca_b1",
     "nca_b2", "nca_alpha", "field_act1", "field_act2", "chem_act", "sens_act",
@@ -17,16 +17,16 @@ GENOME_KEYS = (
 )
 
 
-def snapshot_genome(world, i):
-    rec = {k: getattr(world, k)[i].detach().cpu().clone() for k in GENOME_KEYS}
+def snapshot_laws(world, i):
+    rec = {k: getattr(world, k)[i].detach().cpu().clone() for k in LAW_KEYS}
     rec["craft_map"] = rec["craft_map"].to(torch.int16)
     return rec
 
 
-def load_genome(world, record, spin=100):
+def load_laws(world, record, spin=100):
     with torch.no_grad():
         world.reset()
-        for k in GENOME_KEYS:
+        for k in LAW_KEYS:
             getattr(world, k)[0] = record[k].to(world.device)
         world.refresh_colour_palette()
         for t in range(spin):
@@ -35,7 +35,7 @@ def load_genome(world, record, spin=100):
 
 def generate_pool(path, n, batch_size=48, device="cpu", band=(0.1, 0.65), **world_kwargs):
     # batched universe generation: dynamics filters once, gate redrawn
-    # blockwise; accepted genomes appended to a growing .pt file
+    # blockwise; accepted universes appended to a growing .pt file
     from .env import DEFAULT_WORLD_KWARGS
     from .world import AlienCraftWorld
 
@@ -75,14 +75,14 @@ def generate_pool(path, n, batch_size=48, device="cpu", band=(0.1, 0.65), **worl
                     need & (fr > 0).all(1) & (fr.median(1).values <= 0.6)
                 )
             for i in (ok & gate_ok).nonzero().flatten().tolist():
-                records.append(snapshot_genome(world, i))
+                records.append(snapshot_laws(world, i))
             torch.save(records, path)
             print(f"pool: {len(records)}/{n}", flush=True)
     return records
 
 
 def sample_edge_world(world, band=(0.1, 0.65), tries=96, gate_tries=60):
-    # dynamics filters don't depend on the gate genome, so the gate is
+    # dynamics filters don't depend on the gate law, so the gate is
     # resampled blockwise on worlds whose dynamics already passed
     with torch.no_grad():
         for i in range(tries):

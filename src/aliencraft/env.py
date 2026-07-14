@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from gymnasium import spaces
 
-from .filter import load_genome, sample_edge_world
+from .filter import load_laws, sample_edge_world
 from .world import AlienCraftWorld
 
 # naturals are 5% of the tech tree; the rest is a per-universe recipe DAG
@@ -63,7 +63,7 @@ class AlienCraftEnv(gym.Env):
         with torch.no_grad():
             # reject universes that are frozen, noise, source-blind, or muddy
             if self.pool is not None:
-                load_genome(self.world, self.pool[self.np_random.integers(len(self.pool))])
+                load_laws(self.world, self.pool[self.np_random.integers(len(self.pool))])
             elif self.complexity_band is None:
                 self.world.reset()
             else:
