@@ -112,7 +112,6 @@ class AlienCraftWorld(torch.nn.Module):
 
         self.properties.uniform_(-1.0, 1.0)
 
-        self.mass_scale = 5.0
         self.batch_idx = torch.arange(self.batch_size, device=self.device)
 
         self.agent_position = torch.randint(
@@ -164,9 +163,6 @@ class AlienCraftWorld(torch.nn.Module):
         self.create_actuators()
         self.build_craft_map()
         self.seed_universe()
-
-        self.initial_grid_copy = self.grid.detach().clone()
-        self.initial_agent_position = self.agent_position.detach().clone()
 
     def register_all_buffers(self):
         for name in self.RELOAD_BUFFER_NAMES:
@@ -605,10 +601,9 @@ class AlienCraftWorld(torch.nn.Module):
                 padding=3,
                 groups=b * t,
             ).reshape(b, t, h, w)
+        # any positive constant here cancels in the std normalisation below
         source = (
-            self.mass_scale
-            * self.properties[..., 0].unsqueeze(-1)
-            * self.field_matter_affinity
+            self.properties[..., 0].unsqueeze(-1) * self.field_matter_affinity
         )  # b, num_types, num_fields
         src = torch.einsum("btxy,btf->bfxy", grid, source)
         src = src / src.flatten(1).std(dim=1).clamp_min(1e-6).view(-1, 1, 1, 1)
@@ -952,24 +947,3 @@ class AlienCraftWorld(torch.nn.Module):
             self.create_actuators()
             self.build_craft_map()
             self.seed_universe()
-
-
-if __name__ == "__main__":
-    torch.inference_mode()
-    universe = AlienCraftWorld(
-        batch_size=2,
-        width=10,
-        height=10,
-        num_types=6,
-        visual_field_size=3,
-        num_properties=10,
-        num_fields=3,
-        num_common_types=2,
-        num_sparse_types=2,
-        sprite_resolution=4,
-    )  # create a universe
-    for step in range(1):
-        action = torch.randn(1, 2 + universe.num_types)
-        universe.step(step, action)
-    obs = universe.get_obs_for_agent(agent_view=True)
-    print(obs.shape)
