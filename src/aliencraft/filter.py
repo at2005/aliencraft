@@ -6,9 +6,10 @@ import os
 import torch
 import torch.nn.functional as F
 
-# per-universe tensors that define a universe; everything else is state
+# per-universe tensors that define a universe's laws; layout (grid, agent
+# start) is rerolled fresh on every load, crafter-style
 GENOME_KEYS = (
-    "grid", "agent_position", "properties", "field_matter_affinity",
+    "properties", "field_matter_affinity",
     "prop_tensor", "sens_tensor", "craft_map", "nca_w1", "nca_w2", "nca_b1",
     "nca_b2", "nca_alpha", "field_act1", "field_act2", "chem_act", "sens_act",
     "gate_coeffs", "craft_energy_scale", "gate_ema_beta", "distance_kernel",
@@ -18,7 +19,6 @@ GENOME_KEYS = (
 
 def snapshot_genome(world, i):
     rec = {k: getattr(world, k)[i].detach().cpu().clone() for k in GENOME_KEYS}
-    rec["grid"] = rec["grid"].to(torch.uint8)
     rec["craft_map"] = rec["craft_map"].to(torch.int16)
     return rec
 
@@ -45,8 +45,6 @@ def generate_pool(path, n, batch_size=48, device="cpu", band=(0.1, 0.65), **worl
     with torch.no_grad():
         while len(records) < n:
             world.reset()
-            init_grid = world.grid.detach().cpu().clone()
-            init_pos = world.agent_position.detach().cpu().clone()
             stats = edge_stats(world)
             ok = accept(
                 dict(
@@ -77,10 +75,7 @@ def generate_pool(path, n, batch_size=48, device="cpu", band=(0.1, 0.65), **worl
                     need & (fr > 0).all(1) & (fr.median(1).values <= 0.6)
                 )
             for i in (ok & gate_ok).nonzero().flatten().tolist():
-                rec = snapshot_genome(world, i)
-                rec["grid"] = init_grid[i].to(torch.uint8)
-                rec["agent_position"] = init_pos[i]
-                records.append(rec)
+                records.append(snapshot_genome(world, i))
             torch.save(records, path)
             print(f"pool: {len(records)}/{n}", flush=True)
     return records
