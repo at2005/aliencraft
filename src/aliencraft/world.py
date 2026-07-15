@@ -154,8 +154,10 @@ class AlienCraftWorld(torch.nn.Module):
             self.visual_field_size % self.sprite_resolution == 0
         ), "visual_field_size must be divisible by sprite_resolution"
         
-        nb_start = -self.visual_field_size // 2 + self.sprite_resolution // 2
-        nb_end = nb_start + self.visual_field_size // self.sprite_resolution
+        # window is in cell units, centered on the agent (agent at index n//2)
+        n = self.visual_field_size // self.sprite_resolution
+        nb_start = -(n // 2)
+        nb_end = nb_start + n
 
         ii_nb, jj_nb = torch.meshgrid(
             torch.arange(nb_start, nb_end, device=self.device),
@@ -244,13 +246,12 @@ class AlienCraftWorld(torch.nn.Module):
         self.emission_vec = torch.randn(b, self.num_properties, device=self.device)
         self.emission_act = self._sample_series()
         # sampled locomotion law: bounded force from a bilinear coupling of
-        # the local field jet (gradients + values) with the cell type's
+        # the local field state (gradients + values) with the cell type's
         # affinity and properties; conservation and collisions stay fixed
-        # d_u/d_v are the derived input dims (field jet x type coupling);
-        # the fan-in root keeps the bilinear form at unit variance, and the
+        # the fan-in root keeps the bilinear form near unit variance, and the
         # gain — how nonlinear the sampled law runs — is itself sampled
-        d_u = 3 * f
-        d_v = f + self.num_properties
+        field_state_dim = 3 * f
+        coupling_dim = f + self.num_properties
         force_gain = torch.exp(
             torch.empty(b, 1, 1, 1, device=self.device).uniform_(
                 math.log(1.25), math.log(20.0)
@@ -258,8 +259,8 @@ class AlienCraftWorld(torch.nn.Module):
         )
         self.force_tensor = (
             force_gain
-            * torch.randn(b, 2, d_u, d_v, device=self.device)
-            / (d_u * d_v) ** 0.5
+            * torch.randn(b, 2, field_state_dim, coupling_dim, device=self.device)
+            / (field_state_dim * coupling_dim) ** 0.5
         )
         self.force_act = self._sample_series()
         self._init_gate()
@@ -299,9 +300,7 @@ class AlienCraftWorld(torch.nn.Module):
         self.distance_kernel = kernel / kernel.abs().sum((1, 2), keepdim=True).clamp_min(1e-6)
 
     def _init_mix_tensor(self, dim: int):
-        # zero-mean bilinear mixing, symmetric in the parents; sampled gain
-        # (log-centred on the old calibrated 5) — the closure crafted/depth
-        # bands select against chain collapse and binarisation
+        # sample the bilinear map
         gain = torch.exp(
             torch.empty(self.batch_size, 1, 1, 1, device=self.device).uniform_(
                 math.log(2.0), math.log(12.0)
@@ -335,9 +334,7 @@ class AlienCraftWorld(torch.nn.Module):
         # test for invertibility, will throw runtime error if not invertible
         self.actuators.inverse()
 
-        # pointer actuator: rotation + log-uniform anisotropic scale over
-        # property space; eigenvalues in [1/2, 2] keep every type reachable
-        # from the [-1, 1] action box
+        # ensure all types (mostly) reachable
         p = self.num_properties
         q = torch.linalg.qr(torch.randn(self.batch_size, p, p, device=self.device)).Q
         s = torch.exp(
@@ -346,7 +343,6 @@ class AlienCraftWorld(torch.nn.Module):
             )
         )
         self.pointer_actuator = q @ (s.unsqueeze(-1) * q.transpose(1, 2))
-        self.pointer_actuator.inverse()
 
     def create_colour_palette(self):
         # colour = orthonormal projection of properties; a rotation at P=3,
@@ -628,14 +624,14 @@ class AlienCraftWorld(torch.nn.Module):
 
     def step_grid(self, step: int):
         # sampled locomotion law: force = bounded series over a bilinear
-        # coupling of the local field jet with the cell type's affinity and
-        # properties (gradient descent is one point in this family)
+        # coupling of the local field state with the cell type's affinity
+        # and properties (gradient descent is one point in this family)
         affinity = self.field_matter_affinity[
             self.batch_idx.view(-1, 1, 1), self.grid
         ]  # b, h, w, num_fields
         props = self.properties[self.batch_idx.view(-1, 1, 1), self.grid]
         grad = self.differential.grad(self.fields)  # b, 2, num_fields, h, w
-        jet = torch.cat(
+        field_state = torch.cat(
             [
                 grad.reshape(
                     self.batch_size, 2 * self.num_fields, self.width, self.height
@@ -645,7 +641,9 @@ class AlienCraftWorld(torch.nn.Module):
             dim=1,
         )  # b, 3F, h, w
         coupling = torch.cat([affinity, props], dim=-1)  # b, h, w, F + P
-        q = torch.einsum("bjcd,bchw,bhwd->bjhw", self.force_tensor, jet, coupling)
+        q = torch.einsum(
+            "bjcd,bchw,bhwd->bjhw", self.force_tensor, field_state, coupling
+        )
         force = self._series(q, self.force_act).permute(0, 2, 3, 1)  # b, h, w, 2
 
         self.grid_velocity = self.damping * self.grid_velocity + force * self.dt

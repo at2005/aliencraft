@@ -300,6 +300,7 @@ def render(universe, batch_index=0, cell_size=6):
     frame = _render_frame(universe, batch_index)
     screen = _make_screen(frame, cell_size)
     _draw_frame(screen, frame, cell_size)
+    _draw_agent_star(screen, universe, batch_index, cell_size)
     _draw_inventory(screen, universe, batch_index, 0)
     pygame.display.flip()
     return screen
@@ -324,6 +325,8 @@ def render_animation(
     frame = _initial_frame(universe, batch_index, policy, dream, show_posterior)
     screen = _make_screen(frame, cell_size)
     _draw_frame(screen, frame, cell_size)
+    if not dream:
+        _draw_agent_star(screen, universe, batch_index, cell_size)
     _draw_inventory(screen, universe, batch_index, 0)
     pygame.display.flip()
     clock = pygame.time.Clock()
@@ -381,6 +384,8 @@ def render_animation(
         else:
             frame = _render_frame(universe, batch_index)
         _draw_frame(screen, frame, cell_size)
+        if not dream:
+            _draw_agent_star(screen, universe, batch_index, cell_size)
         _draw_inventory(screen, universe, batch_index, registered_crafts)
         caption = f"aliencraft step {step} | {_describe_agent_position(universe)}"
         if dream:
@@ -405,21 +410,30 @@ def render_animation(
 
 
 def _render_frame(universe, batch_index):
-    frame = universe.get_obs_for_agent()[batch_index].byte()
-    return _draw_agent_marker(universe, frame, batch_index)
+    return universe.get_obs_for_agent()[batch_index].byte()
 
 
-def _draw_agent_marker(universe, frame, batch_index):
-    x, y = universe.agent_position[batch_index].detach().cpu().tolist()
-    size = universe.sprite_resolution
-    x0, y0 = x * size, y * size
-    frame = frame.clone()
-    frame[x0 : x0 + size, y0 : y0 + size] = frame.new_tensor([255, 255, 255])
-    if size > 2:
-        frame[x0 + 1 : x0 + size - 1, y0 + 1 : y0 + size - 1] = frame.new_tensor(
-            [255, 40, 220]
-        )
-    return frame
+def _star_points(cx, cy, outer, inner, n=5):
+    points = []
+    for i in range(2 * n):
+        radius = outer if i % 2 == 0 else inner
+        angle = -math.pi / 2 + i * math.pi / n
+        points.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+    return points
+
+
+def _draw_agent_star(screen, universe, batch_index, cell_size):
+    # agent marker: star centered on the agent's cell, drawn in screen space
+    row, col = universe.agent_position[batch_index].detach().cpu().tolist()
+    span = universe.sprite_resolution * cell_size
+    cx = (col + 0.5) * span
+    cy = (row + 0.5) * span
+    pygame.draw.polygon(
+        screen, (255, 255, 255), _star_points(cx, cy, 0.85 * span, 0.34 * span)
+    )
+    pygame.draw.polygon(
+        screen, (255, 40, 220), _star_points(cx, cy, 0.62 * span, 0.25 * span)
+    )
 
 
 def _manual_action_from_input(universe, events, manual_state):
