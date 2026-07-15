@@ -75,3 +75,37 @@ While we do have some constraints in our rule-space, we find that our “sample 
 - Median gate open area must be less than 60% of the total grid. If gates are open everywhere this removes the location barrier to crafting.
 - The median per-channel color difference between materials >= 30
 - Number of possibly craftable materials within [10, 300]
+
+## Using the Gym Wrapper
+
+Gymnasium support is an optional extra:
+
+```bash
+pip install -e ".[gym]"
+```
+
+Importing `aliencraft` registers `AlienCraft-v0`:
+
+```python
+import gymnasium as gym
+import aliencraft  # registers AlienCraft-v0
+
+env = gym.make("AlienCraft-v0")
+obs, info = env.reset(seed=0)  # seed controls world generation
+obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+```
+
+- **Observation**: `(visual_field_size, visual_field_size, 3)` float32 RGB in [0, 1], centered on the agent (32x32 by default).
+- **Action**: continuous `Box(-1, 1)` of size `2 + num_properties` (5 by default): 2 motion dimensions plus a property-space pointer used for the nearest-neighbour inventory lookup.
+- **Reward**: +1 for each newly discovered material.
+- **Episodes**: truncated at `max_episode_steps` (default 1000); there is no terminal state.
+- `info` reports `discovered_types` and `agent_position`.
+
+Useful `gym.make` kwargs:
+
+- `max_episode_steps`, `device`, and any `AlienCraftWorld` kwarg (e.g. `visual_field_size=64` for CNN policies that need larger inputs).
+- `complexity_band` — gzip-ratio band for the complexity filters (default `(0.1, 0.65)`); pass `None` to sample unfiltered worlds.
+- `pool` — path to a `torch.save`d pool of pre-filtered laws; each reset draws from the pool instead of sampling and filtering a fresh world.
+- `render_mode="rgb_array"` — `env.render()` returns a full-world uint8 frame.
+
+See `baselines/ppo_sb3.py` for a complete example training a PPO agent with stable-baselines3.
