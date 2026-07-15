@@ -398,6 +398,17 @@ class AlienCraftWorld(torch.nn.Module):
 
         self.sprites = perlin
 
+        # reserved agent sprite: diamond mask, composited into observations
+        r = self.sprite_resolution
+        ii, jj = torch.meshgrid(
+            torch.arange(r, device=self.device),
+            torch.arange(r, device=self.device),
+            indexing="ij",
+        )
+        c = (r - 1) / 2
+        l1 = (ii - c).abs() + (jj - c).abs()
+        self.agent_sprite = 1 - (l1 - l1.min()) / (l1.max() - l1.min())
+
     def _init_craft_law(self):
         # craftability is a sampled symmetric law over the parents' observable properties
         assert (
@@ -970,6 +981,23 @@ class AlienCraftWorld(torch.nn.Module):
         final_colour = (
             (rgb_grid * noise).clamp(0, 255).floor().long()
         )  # b, h * sprite_resolution, w * sprite_resolution, 3
+
+        # agent marker: fixed diamond sprite blended over the agent's cell
+        # in white; the stable shape marks it against the Perlin textures
+        r = self.sprite_resolution
+        if agent_view:
+            cell = torch.full_like(self.agent_position, grid.shape[-1] // 2)
+        else:
+            cell = self.agent_position
+        rows = cell[..., 0:1] * r + torch.arange(r, device=self.device)  # b, r
+        cols = cell[..., 1:2] * r + torch.arange(r, device=self.device)
+        m = (0.85 * self.agent_sprite).view(1, r, r, 1)
+        block = final_colour[
+            self.batch_idx[:, None, None], rows[:, :, None], cols[:, None, :]
+        ]
+        final_colour[
+            self.batch_idx[:, None, None], rows[:, :, None], cols[:, None, :]
+        ] = (block * (1 - m) + 255 * m).long()
 
         if normalise:
             # normalise betwee 0 and 1
