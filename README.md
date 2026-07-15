@@ -20,7 +20,7 @@ Another way to train meta reinforcement learners is to build a procedural genera
 
 ## AlienCraft
 
-Motivated by these design principles we introduce AlienCraft, an open-ended 2D grid-world environment similar to Crafter but where the physics and chemistry is sampled per-episode.
+Motivated by these design principles we introduce AlienCraft, an open-ended 2D grid-world environment, similar to Crafter, but where a new physics and chemistry is sampled per-episode.
 
 ### Materials
 
@@ -28,7 +28,7 @@ Each cell is either empty or contains a material, initially distributed with Per
 
 ### Fields
 
-Each world possesses three scalar fields. These are partially observable to the agent, with local field values tinting materials’ base colors.
+Each world has three scalar fields. These are partially observable to the agent, with local field values tinting materials’ base colors.
 
 Materials couple to fields via an affinity vector. The coupling is symmetric in that matter sources fields and fields influence matter. Emissions from matter are deposited in its neighbourhood using a sampled 7x7 radially-symmetric kernel. The influence of matter on fields is determined by a 3x3 sampled kernel. This parameterization gives us complex fields with the inductive bias of locality.
 
@@ -39,7 +39,7 @@ A craft is a commuting operation between two materials. Material 1 + Material 2 
 How does an agent craft? It places the two materials beside each other, and selects the craft action. A craft succeeds iff:
 
 - $g(p1^T F p2) > threshold$ (set so that 25-40% of all pairs are craftable). $F$ is symmetric by construction.
-- $h(z^T G z) > 0$, where $z = [EMA-normalized local fields, p1_affinity + p2_affinity, p1_properties + p2_properties]$
+- $h(z^T G z) > 0$, where $z$ = [EMA-normalized local fields, p1_affinity + p2_affinity, p1_properties + p2_properties]
 
 Both $h$ and $g$ are sampled as bounded nonlinearities, similar to $f$. If the resulting material properties are within epsilon of an existing material, we craft that material. Otherwise we treat it as a new material.
 
