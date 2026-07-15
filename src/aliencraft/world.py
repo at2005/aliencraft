@@ -1,7 +1,15 @@
 import torch
 import torch.nn.functional as F
-from differential import Differential
 import math
+
+
+def spatial_grad(field):
+    # central differences per channel; field (b, c, h, w) -> (b, 2, c, h, w)
+    c = field.shape[1]
+    kx = field.new_tensor([[0.0, 0.0, 0.0], [-1.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
+    grad_x = F.conv2d(field, kx.expand(c, 1, 3, 3), padding=1, groups=c)
+    grad_y = F.conv2d(field, kx.T.expand(c, 1, 3, 3), padding=1, groups=c)
+    return 0.5 * torch.stack([grad_x, grad_y], dim=1)
 
 
 class AlienCraftWorld(torch.nn.Module):
@@ -96,8 +104,6 @@ class AlienCraftWorld(torch.nn.Module):
         assert (
             self.num_common_types + self.num_sparse_types <= self.num_types
         ), "num_common_types + num_sparse_types must be less than num_types"
-
-        self.differential = Differential(num_fields).to(self.device)
 
         self.dt = 0.1
         self.damping = 0.90
@@ -630,7 +636,7 @@ class AlienCraftWorld(torch.nn.Module):
             self.batch_idx.view(-1, 1, 1), self.grid
         ]  # b, h, w, num_fields
         props = self.properties[self.batch_idx.view(-1, 1, 1), self.grid]
-        grad = self.differential.grad(self.fields)  # b, 2, num_fields, h, w
+        grad = spatial_grad(self.fields)  # b, 2, num_fields, h, w
         field_state = torch.cat(
             [
                 grad.reshape(

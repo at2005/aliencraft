@@ -22,9 +22,7 @@ baselines = [
     "stable-baselines3>=2.3",
 ]
 render = [
-    "matplotlib>=3.9.4",
     "numpy>=2.0.2",
-    "pillow",
     "pygame>=2.6.1",
 ]
 dev = [
