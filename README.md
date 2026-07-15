@@ -8,7 +8,7 @@
 
 ## Introduction
 
-A long-held goal of reinforcement learning has been to create agents that are able to navigate new worlds at test time without being explicitly trained on them. How do we evaluate progress towards this north star, this meta reinforcement-learner? DeepMind’s Alchemy (Wang et al., 2021) is an environment in which an agent must learn an abstract sampled “chemistry” at test time. However, Alchemy samples from a fixed parameterized family, which limits environment diversity. We’re releasing a research preview of AlienCraft, a procedural open-ended world generator that samples a new latent physics and chemistry for every world. We expect AlienCraft to be changed as people train models on it and we identify points of improvement.
+A long-held goal of reinforcement learning has been to create agents that are able to navigate new worlds at test time without being explicitly trained on them. How do we evaluate progress towards this north star, this meta reinforcement-learner? DeepMind’s Alchemy (Wang et al., 2021) is an environment in which an agent must learn an abstract sampled “chemistry” at test time. However, Alchemy samples from a fixed parameterized family, which limits environment diversity. We’re releasing a research preview of AlienCraft, a procedural open-ended world generator that samples a new latent physics and chemistry for every world. We expect AlienCraft to be rapidly iterated on as people train models on it and we identify points of improvement.
 
 ## Motivation
 
