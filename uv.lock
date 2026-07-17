@@ -39,6 +39,7 @@ render = [
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pillow" },
     { name = "pygame" },
 ]
 
@@ -49,6 +50,7 @@ requires-dist = [
     { name = "gymnasium", marker = "extra == 'baselines'", specifier = ">=0.29" },
     { name = "gymnasium", marker = "extra == 'gym'", specifier = ">=0.29" },
     { name = "numpy", marker = "extra == 'render'", specifier = ">=2.0.2" },
+    { name = "pillow", marker = "extra == 'render'", specifier = ">=11.0" },
     { name = "pygame", marker = "extra == 'render'", specifier = ">=2.6.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "stable-baselines3", marker = "extra == 'baselines'", specifier = ">=2.3" },

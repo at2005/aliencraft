@@ -2,7 +2,7 @@
 
 # AlienCraft: A Meta-Reinforcement-Learning Environment Generator for Open-Ended Explorers
 
-![Agent-view rollouts in six sampled universes](assets/agent_view.gif)
+Agent-view rollouts in six sampled universes
 
 *Agent-centered observations of an agent taking random actions in six AlienCraft-generated universes*
 
@@ -20,7 +20,7 @@ Another way to train meta reinforcement learners is to build a procedural genera
 
 ## AlienCraft
 
-Motivated by these design principles we introduce AlienCraft, an open-ended 2D grid-world environment, similar to Crafter, but where a new physics and chemistry is sampled per-episode.
+Motivated by these design principles we introduce AlienCraft, an open-ended 2D grid-world environment, similar to Crafter, but where a new physics and chemistry is sampled per-episode. The goal with AlienCraft is to have some way to generate as many diverse environments as possible. Why? The hope is that by maximising the diversity of our environments we instill strong meta-learning abilities in our models. Maybe we get this by training models on sufficiently complicated open-ended environments like Minecraft, but we think that the amount of in-context learning a model good at AlienCraft must do is significantly higher than a Minecraft/Crafter model.
 
 ### Materials
 
@@ -79,6 +79,8 @@ While we do have some constraints in our rule-space, we find that our “sample 
 - Median gate open area must be less than 60% of the total grid. If gates are open everywhere this removes the location barrier to crafting.
 - The median per-channel color difference between materials >= 30
 - Number of possibly craftable materials within [10, 300]
+
+
 
 ## Using the Gym Wrapper
 
