@@ -3,6 +3,7 @@
 # AlienCraft: A Meta-Reinforcement-Learning Environment Generator for Open-Ended Explorers
 
 ![Agent-view rollouts in six sampled universes](assets/agent_view.gif)
+
 *Agent-centered observations of an agent taking random actions in six AlienCraft-generated universes*
 
 ## Introduction
